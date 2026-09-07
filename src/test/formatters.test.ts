@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { formatDate, formatDateTime, formatRelativeTime, formatPhone, maskAadhaar, getInitials, exportToCSV } from '@/utils/formatters';
+import { formatDate, formatDateTime, formatRelativeTime, formatPhone, aadhaarStatus, getInitials, exportToCSV } from '@/utils/formatters';
 
 describe('formatDate', () => {
   it('returns — for null', () => {
@@ -67,22 +67,18 @@ describe('formatPhone', () => {
   });
 });
 
-describe('maskAadhaar', () => {
-  it('returns — for null', () => {
-    expect(maskAadhaar(null)).toBe('—');
+describe('aadhaarStatus', () => {
+  it('returns not-provided for null', () => {
+    expect(aadhaarStatus(null)).toBe('Not provided yet');
   });
-  it('returns — for undefined', () => {
-    expect(maskAadhaar(undefined)).toBe('—');
+  it('returns not-provided for undefined', () => {
+    expect(aadhaarStatus(undefined)).toBe('Not provided yet');
   });
-  it('masks 12-digit Aadhaar correctly', () => {
-    expect(maskAadhaar('123456789012')).toBe('XXXX XXXX 9012');
+  it('returns not-provided for a PENDING_ placeholder', () => {
+    expect(aadhaarStatus('PENDING_abc123')).toBe('Not provided yet');
   });
-  it('returns raw value for non-12-digit', () => {
-    expect(maskAadhaar('12345')).toBe('12345');
-  });
-  it('shows only last 4 digits', () => {
-    const result = maskAadhaar('999900001234');
-    expect(result).toBe('XXXX XXXX 1234');
+  it('never reveals the stored hash, just presence', () => {
+    expect(aadhaarStatus('a'.repeat(64))).toBe('On file');
   });
 });
 

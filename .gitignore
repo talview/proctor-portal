@@ -6,11 +6,23 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
-.serena
+
 node_modules
 dist
 dist-ssr
 *.local
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Stray build artifacts
+vite.config.ts.timestamp-*.mjs
+
+# Supabase CLI local state
+supabase/.temp
+supabase/.branches
 
 # Editor directories and files
 .vscode/*
@@ -22,14 +34,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-
-# Environment variables
-.env
-.env.*
-!.env.example
-
-# Supabase temp files
-supabase/.temp/
-
-# Vite temp files
-vite.config.ts.timestamp-*.mjs

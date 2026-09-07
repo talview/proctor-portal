@@ -3,8 +3,8 @@ import { proctorService } from '@/services/proctor';
 import { useAuthStore } from '@/stores/auth';
 import { supabase } from '@/services/supabase';
 import { getScopedVendor } from '@/utils/access';
-import Card from '@/components/ui/Card';
 import Table from '@/components/ui/Table';
+import LoadingSpinner from '@/components/ui/LoadingSpinner';
 
 export default function DashboardPage() {
   const { user } = useAuthStore();
@@ -45,15 +45,13 @@ export default function DashboardPage() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-text2">Loading dashboard...</div>
+        <div className="flex flex-col items-center gap-3">
+          <LoadingSpinner size="md" />
+          <p className="text-text2 text-sm">Loading dashboard...</p>
+        </div>
       </div>
     );
   }
-
-  // Vendor breakdown rows, flattened for the Table component
-  const vendorRows = Object.entries(stats?.byVendor || {}).map(
-    ([vendor, data]: [string, any]) => ({ vendor, ...data })
-  );
 
   const formatDate = (dateStr: string) => {
     const date = new Date(dateStr);
@@ -74,22 +72,6 @@ export default function DashboardPage() {
     );
   };
 
-  // Vendor badge with color (matching HTML app)
-  const getVendorBadge = (vendor: string) => {
-    const vendorColors: Record<string, string> = {
-      'Sai': 'bg-blue-500/15 text-blue-400',
-      'TSN': 'bg-purple-500/15 text-purple-400',
-      'Avner': 'bg-emerald-400/15 text-emerald-400',
-      'A&M': 'bg-amber-500/15 text-amber-400',
-      'ATS': 'bg-red-400/15 text-red-400',
-      'Awign': 'bg-orange-400/15 text-orange-400',
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${vendorColors[vendor] || 'bg-accent/10 text-accent'}`}>
-        {vendor}
-      </span>
-    );
-  };
 
   return (
     <div>
@@ -144,49 +126,17 @@ export default function DashboardPage() {
             Vendor Breakdown
           </h3>
           <Table
-            data={vendorRows}
+            data={Object.entries(stats?.byVendor || {}).map(([vendor, data]: [string, any]) => ({ vendor, ...data }))}
             columns={[
-              {
-                header: 'Vendor',
-                accessor: (row) => getVendorBadge(row.vendor),
-              },
-              {
-                header: 'Total',
-                accessor: (row) => row.total,
-                className: 'text-right font-mono text-sm text-text',
-              },
-              {
-                header: 'In Progress',
-                accessor: (row) => row.inProgress,
-                className: 'text-right font-mono text-sm text-warning',
-              },
-              {
-                header: 'Active',
-                accessor: (row) => row.active,
-                className: 'text-right font-mono text-sm text-success',
-              },
-              {
-                header: 'BGV Missing',
-                accessor: (row) => row.bgvMissing,
-                className: 'text-right font-mono text-sm text-warning',
-              },
-              {
-                header: 'BGV Overdue',
-                accessor: (row) => row.bgvOverdue,
-                className: 'text-right font-mono text-sm text-danger',
-              },
-              {
-                header: 'Demo Cert',
-                accessor: (row) => row.demoCert,
-                className: 'text-right font-mono text-sm text-[#7c3aed]',
-              },
-              {
-                header: 'Assess Cert',
-                accessor: (row) => row.assessCert,
-                className: 'text-right font-mono text-sm text-accent',
-              },
+              { header: 'Vendor', accessor: (row) => row.vendor, className: 'text-[13px] font-semibold text-text' },
+              { header: 'Total', accessor: (row) => row.total, className: 'text-right font-mono text-sm text-text', headerClassName: 'text-right' },
+              { header: 'In Progress', accessor: (row) => row.inProgress, className: 'text-right font-mono text-sm text-warning', headerClassName: 'text-right' },
+              { header: 'Active', accessor: (row) => row.active, className: 'text-right font-mono text-sm text-success', headerClassName: 'text-right' },
+              { header: 'BGV Missing', accessor: (row) => row.bgvMissing, className: 'text-right font-mono text-sm text-warning', headerClassName: 'text-right' },
+              { header: 'BGV Overdue', accessor: (row) => row.bgvOverdue, className: 'text-right font-mono text-sm text-danger', headerClassName: 'text-right' },
+              { header: 'Demo Cert', accessor: (row) => row.demoCert, className: 'text-right font-mono text-sm text-[#7c3aed]', headerClassName: 'text-right' },
+              { header: 'Assess Cert', accessor: (row) => row.assessCert, className: 'text-right font-mono text-sm text-accent', headerClassName: 'text-right' },
             ]}
-            emptyMessage="No vendor data available"
           />
         </div>
       )}
@@ -198,26 +148,13 @@ export default function DashboardPage() {
         </h3>
         <Table
           data={recentActivity}
-          columns={[
-            {
-              header: 'Name',
-              accessor: 'name',
-            },
-            {
-              header: 'Managed By',
-              accessor: (row: any) => getVendorBadge(row.vendor || row.managed_by),
-            },
-            {
-              header: 'Status',
-              accessor: (row: any) => getStatusBadge(row.status),
-            },
-            {
-              header: 'Updated',
-              accessor: (row: any) => formatDate(row.upd),
-              className: 'text-[12px] text-text3',
-            },
-          ]}
           emptyMessage="No activity yet"
+          columns={[
+            { header: 'Name', accessor: (p: any) => p.name, className: 'text-[13px] font-semibold text-text' },
+            { header: 'Vendor', accessor: (p: any) => p.vendor || p.managed_by || '—', className: 'text-[12px] text-text2 font-medium' },
+            { header: 'Status', accessor: (p: any) => getStatusBadge(p.status) },
+            { header: 'Updated', accessor: (p: any) => formatDate(p.upd), className: 'text-[12px] text-text3' },
+          ]}
         />
       </div>
     </div>
@@ -234,8 +171,8 @@ interface StatCardProps {
 
 function StatCard({ label, value, subtitle, valueColor = 'text-text', className = '' }: StatCardProps) {
   return (
-    <Card
-      className={`p-4 border-l-[3px] ${className}`}
+    <div
+      className={`bg-surface border border-border rounded-lg p-4 border-l-[3px] ${className}`}
     >
       <div className="text-[11px] font-semibold text-text3 uppercase tracking-wide mb-2">
         {label}
@@ -248,6 +185,6 @@ function StatCard({ label, value, subtitle, valueColor = 'text-text', className 
           {subtitle}
         </div>
       )}
-    </Card>
+    </div>
   );
 }

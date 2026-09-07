@@ -1,19 +1,17 @@
-import { useQueryClient } from '@tanstack/react-query';
-import { Outlet } from 'react-router';
+import { Outlet } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import Topbar from './Topbar';
-import { useRealtimeSync } from '@/hooks/useRealtimeSync';
+import { useUIStore } from '@/stores/ui';
 
 export default function MainLayout() {
-  const queryClient = useQueryClient();
-  useRealtimeSync(queryClient);
+  const { sidebarCollapsed } = useUIStore();
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex min-h-screen bg-bg">
       <Sidebar />
-      <main className="flex-1 ml-60 min-w-0 flex flex-col">
+      <main className={`flex-1 min-w-0 overflow-x-hidden ${sidebarCollapsed ? 'ml-[72px]' : 'ml-52'} max-md:ml-[72px] flex flex-col bg-bg transition-all duration-200`}>
         <Topbar />
-        <div className="flex-1 p-6">
+        <div className="flex-1 min-w-0 overflow-x-hidden p-6 bg-bg">
           <Outlet />
         </div>
       </main>

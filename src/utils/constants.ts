@@ -56,3 +56,13 @@ export const STATUS_BADGES = {
   Offboarded: 'bg-danger/15 text-danger',
   Archived: 'bg-text3/15 text-text3',
 } as const;
+
+/** Evaluation result reason options, keyed by result -- shown in a dropdown that
+ * depends on the selected result, in both the Evaluations page and Workspace's
+ * evaluation result modals. */
+export const EVAL_REASON_OPTIONS_BY_RESULT: Record<string, string[]> = {
+  Pass: ['Strong overall performance', 'Excellent communication', 'Met all criteria', 'Good technical knowledge'],
+  Reattempt: ['Needs more preparation', 'Communication issues', 'Incomplete responses', 'Technical knowledge gaps', 'Nervousness/confidence issues'],
+  'No Show': ['Proctor did not show up', 'Connection issues reported', 'Notified late cancellation', 'No prior notice'],
+  Reschedule: ['Rescheduled by proctor', 'Rescheduled by panel', 'Technical issues during session', 'Emergency situation'],
+};

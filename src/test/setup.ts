@@ -19,6 +19,11 @@ vi.mock('@/services/supabase', () => ({
       maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
     })),
     rpc: vi.fn().mockResolvedValue({ data: [], error: null }),
+    auth: {
+      getSession: vi.fn().mockResolvedValue({ data: { session: null }, error: null }),
+      signInWithPassword: vi.fn().mockResolvedValue({ data: { user: null, session: null }, error: { message: 'Invalid credentials' } }),
+      signOut: vi.fn().mockResolvedValue({ error: null }),
+    },
     storage: {
       from: vi.fn(() => ({
         upload: vi.fn().mockResolvedValue({ data: { path: 'test/path' }, error: null }),

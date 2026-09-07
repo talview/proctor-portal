@@ -1,18 +1,23 @@
 import { useRef, useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Video, FileEdit, BarChart3, Download, CheckCircle2, User, Users, Upload, AlertTriangle, RefreshCw, Save, ExternalLink, ChevronDown, History } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
+import { usePaginatedQuery } from '@/hooks/usePaginatedQuery';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Card from '@/components/ui/Card';
 import Table from '@/components/ui/Table';
-import Tabs from '@/components/ui/Tabs';
 import { logAudit } from '@/services/audit';
-import { PROCTOR_TYPES } from '@/utils/constants';
+import { downloadCsv } from '@/lib/csv';
+import { showAlert } from '@/components/ui/GlobalDialog';
+import { PROCTOR_TYPES, EVAL_REASON_OPTIONS_BY_RESULT } from '@/utils/constants';
 import { useManagedByOptions } from '@/hooks/useManagedByOptions';
-import type { Proctor, Evaluation } from '@/types';
+import ClearFiltersButton from '@/components/ui/ClearFiltersButton';
+import UnderlineTabs from '@/components/ui/UnderlineTabs';
+import CompactSegmentedTabs from '@/components/ui/CompactSegmentedTabs';
+import type { Proctor } from '@/types';
 
 export default function EvaluationsPage() {
   const [activeTab, setActiveTab] = useState(0);
@@ -33,15 +38,17 @@ export default function EvaluationsPage() {
   return (
     <div>
       {/* Main Tabs */}
-      <Tabs
-        tabs={[
-          { id: 0, label: '🎭 Demo' },
-          { id: 1, label: '📝 Assessment' },
-          { id: 2, label: '📊 Results' },
-        ]}
-        activeTab={activeTab}
-        onChange={(id) => setActiveTab(id as number)}
-      />
+      <div className="mb-6">
+        <UnderlineTabs
+          options={[
+            { label: 'Demo', value: 0, icon: Video },
+            { label: 'Assessment', value: 1, icon: FileEdit },
+            { label: 'Results', value: 2, icon: BarChart3 },
+          ]}
+          value={activeTab}
+          onChange={setActiveTab}
+        />
+      </div>
 
       {/* Tab Content */}
       {activeTab === 0 && <DemoTab />}
@@ -58,23 +65,12 @@ function usePanelUsers() {
       const { data, error } = await supabase
         .from('users')
         .select('username')
-        .eq('role', 'talview');
+        .in('role', ['coordinator', 'admin']);
 
       if (error) throw error;
       return (data || []).map((u: any) => u.username).filter(Boolean) as string[];
     },
   });
-}
-
-function downloadCsv(filename: string, header: string, rows: string[][]) {
-  const BOM = '\uFEFF';
-  const csv = BOM + header + '\n' + rows.map((row) => row.map((value) => `"${String(value ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(a.href);
 }
 
 function DemoTab() {
@@ -88,6 +84,7 @@ function DemoTab() {
   const [scoreOutOf, setScoreOutOf] = useState('');
   const queryClient = useQueryClient();
   const { user } = useAuthStore();
+  const isVendor = user?.role === 'vendor';
   const { data: panelUsers = [] } = usePanelUsers();
   const { data: managedByOptions = [] } = useManagedByOptions();
 
@@ -97,7 +94,7 @@ function DemoTab() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('proctors')
-        .select('*')
+        .select('id, name, email, managed_by, vendor, ptype, demo_ready_attempt, at')
         .eq('demo_ready', 'ready')
         .order('at', { ascending: false });
 
@@ -129,48 +126,17 @@ function DemoTab() {
       const selected = proctors.filter((p) => selectedProctors.has(p.id));
       if (!selected.length) throw new Error('No proctors selected');
 
-      const scheduledAt = new Date().toISOString();
       await Promise.all(selected.map(async (p) => {
-        const { data: prevRows, error: prevError } = await supabase
-          .from('proctor_evaluations')
-          .select('attempt_number')
-          .eq('proctor_id', p.id)
-          .eq('eval_type', 'demo')
-          .order('attempt_number', { ascending: false })
-          .limit(1);
+        const { data: attempt, error: scheduleError } = await supabase.rpc('schedule_evaluation', {
+          p_proctor_id: p.id,
+          p_eval_type: 'demo',
+          p_panel_user: panelUser,
+          p_scheduled_date: scheduledDate,
+          p_scheduled_time: scheduledTime,
+          p_score_out_of: Number(scoreOutOf),
+          });
 
-        if (prevError) throw prevError;
-
-        const attempt = (prevRows?.[0]?.attempt_number || 0) + 1;
-
-        const { error: insertError } = await supabase.from('proctor_evaluations').insert({
-          id: crypto.randomUUID(),
-          proctor_id: p.id,
-          eval_type: 'demo',
-          panel_user: panelUser,
-          scheduled_date: scheduledDate,
-          scheduled_time: scheduledTime,
-          score_out_of: Number(scoreOutOf),
-          result: null,
-          attempt_number: attempt,
-          comment: '',
-          created_at: scheduledAt,
-          created_by: user?.username || user?.email || 'system',
-          status: 'scheduled',
-        });
-
-        if (insertError) throw insertError;
-
-        const { error: updateError } = await supabase
-          .from('proctors')
-          .update({
-            demo_ready: 'scheduled',
-            demo_ready_attempt: attempt,
-            upd: scheduledAt,
-          })
-          .eq('id', p.id);
-
-        if (updateError) throw updateError;
+        if (scheduleError) throw scheduleError;
 
         await logAudit({
           action: 'Demo Scheduled',
@@ -181,7 +147,7 @@ function DemoTab() {
       }));
     },
     onSuccess: async () => {
-      alert(`Demo scheduled for ${selectedProctors.size} proctor${selectedProctors.size !== 1 ? 's' : ''}`);
+      showAlert(`Demo scheduled for ${selectedProctors.size} proctor${selectedProctors.size !== 1 ? 's' : ''}`, { tone: 'success' });
       setSelectedProctors(new Set());
       setPanelUser('');
       setScheduledDate('');
@@ -192,7 +158,7 @@ function DemoTab() {
       await queryClient.invalidateQueries({ queryKey: ['proctors'] });
     },
     onError: (error: any) => {
-      alert('Failed to schedule demo: ' + error.message);
+      showAlert('Failed to schedule demo: ' + error.message, { tone: 'error' });
     },
   });
 
@@ -211,13 +177,13 @@ function DemoTab() {
 
   const exportReadyList = () => {
     if (filteredProctors.length === 0) {
-      alert('No proctors to export');
+      showAlert('No proctors to export', { tone: 'error' });
       return;
     }
 
     downloadCsv(
       `demo_ready_list_${new Date().toISOString().slice(0, 10)}.csv`,
-      'Name,Managed By,Type,Demo Status,Attempts',
+      ['Name', 'Vendor', 'Type', 'Demo Status', 'Attempts'],
       filteredProctors.map((p) => [
         p.name || '',
         p.vendor || '',
@@ -246,41 +212,27 @@ function DemoTab() {
     setSelectedProctors(newSet);
   };
 
-  const getVendorBadge = (vendor: string) => {
-    const vendorColors: Record<string, string> = {
-      'Sai': 'bg-blue-500/15 text-blue-400',
-      'TSN': 'bg-purple-500/15 text-purple-400',
-      'Avner': 'bg-emerald-400/15 text-emerald-400',
-      'A&M': 'bg-amber-500/15 text-amber-400',
-      'ATS': 'bg-red-400/15 text-red-400',
-      'Awign': 'bg-orange-400/15 text-orange-400',
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${vendorColors[vendor] || 'bg-accent/10 text-accent'}`}>
-        {vendor}
-      </span>
-    );
-  };
-
   return (
     <div>
       {/* Filters */}
       <div className="flex gap-2 mb-4 flex-wrap items-center">
         <Input
-          placeholder="🔍 Name, email..."
+          placeholder="Name, email..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 min-w-[180px]"
+          wrapperClassName="flex-1 min-w-[180px]"
         />
-        <Select
-          options={[
-            { value: '', label: 'All Managed By' },
-            ...managedByOptions,
-          ]}
-          value={vendorFilter}
-          onChange={(e) => setVendorFilter(e.target.value)}
-          className="min-w-[160px]"
-        />
+        {!isVendor && (
+          <Select
+            options={[
+              { value: '', label: 'All Vendors' },
+              ...managedByOptions,
+            ]}
+            value={vendorFilter}
+            onChange={(e) => setVendorFilter(e.target.value)}
+            wrapperClassName="min-w-[160px]"
+          />
+        )}
         <Select
           options={[
             { value: '', label: 'All Types' },
@@ -288,10 +240,18 @@ function DemoTab() {
           ]}
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value)}
-          className="min-w-[120px]"
+          wrapperClassName="min-w-[120px]"
+        />
+        <ClearFiltersButton
+          show={!!(search || vendorFilter || typeFilter)}
+          onClick={() => {
+            setSearch('');
+            setVendorFilter('');
+            setTypeFilter('');
+          }}
         />
         <Button variant="ghost" size="sm" onClick={exportReadyList}>
-          ⬇ Export
+<Download className="w-3.5 h-3.5" /> Export
         </Button>
         <label className="flex items-center gap-2 text-xs text-text2 cursor-pointer whitespace-nowrap">
           <input
@@ -328,16 +288,8 @@ function DemoTab() {
               ),
               className: 'w-8',
             },
-            {
-              header: 'Name',
-              accessor: (proctor) => (
-                <span className="text-text font-semibold">{proctor.name}</span>
-              ),
-            },
-            {
-              header: 'Managed By',
-              accessor: (proctor) => getVendorBadge(proctor.vendor!),
-            },
+            { header: 'Name', accessor: (proctor) => proctor.name, className: 'text-[13px] text-text font-semibold' },
+            { header: 'Vendor', accessor: (proctor) => proctor.vendor, className: 'text-[12px] text-text2' },
             {
               header: 'Type',
               accessor: (proctor) => (
@@ -352,9 +304,8 @@ function DemoTab() {
             },
             {
               header: 'Attempts',
-              accessor: (proctor) => (
-                <span className="text-[12px] text-text3">{proctor.demo_ready_attempt || 0}</span>
-              ),
+              accessor: (proctor) => proctor.demo_ready_attempt || 0,
+              className: 'text-[12px] text-text3',
             },
           ]}
         />
@@ -406,7 +357,7 @@ function DemoTab() {
               onClick={() => scheduleMutation.mutate()}
               disabled={scheduleMutation.isPending}
             >
-              {scheduleMutation.isPending ? 'Scheduling...' : '✅ Schedule Demo'}
+              {scheduleMutation.isPending ? 'Scheduling...' : <><CheckCircle2 className="w-4 h-4" /> Schedule Demo</>}
             </Button>
           </div>
         </div>
@@ -431,27 +382,15 @@ function AssessmentTab({ bulkAssessConfig, setBulkAssessConfig }: {
   return (
     <div>
       {/* Sub Tabs */}
-      <div className="flex gap-2 mb-4 border-b border-border">
-        <button
-          className={`px-3 py-2 text-xs font-medium transition-colors ${
-            subTab === 0
-              ? 'text-accent border-b-2 border-accent'
-              : 'text-text3 hover:text-text'
-          }`}
-          onClick={() => setSubTab(0)}
-        >
-          👤 Individual Assign
-        </button>
-        <button
-          className={`px-3 py-2 text-xs font-medium transition-colors ${
-            subTab === 1
-              ? 'text-accent border-b-2 border-accent'
-              : 'text-text3 hover:text-text'
-          }`}
-          onClick={() => setSubTab(1)}
-        >
-          👥 Multi Assign (Bulk)
-        </button>
+      <div className="mb-4">
+        <CompactSegmentedTabs
+          options={[
+            { label: 'Individual Assign', value: 0, icon: User },
+            { label: 'Multi Assign (Bulk)', value: 1, icon: Users },
+          ]}
+          value={subTab}
+          onChange={setSubTab}
+        />
       </div>
 
       {subTab === 0 ? <IndividualAssessment /> : <BulkAssessment bulkAssessConfig={bulkAssessConfig} setBulkAssessConfig={setBulkAssessConfig} />}
@@ -470,6 +409,7 @@ function IndividualAssessment() {
   const [scoreOutOf, setScoreOutOf] = useState('');
   const queryClient = useQueryClient();
   const { user } = useAuthStore();
+  const isVendor = user?.role === 'vendor';
   const { data: panelUsers = [] } = usePanelUsers();
   const { data: managedByOptions = [] } = useManagedByOptions();
 
@@ -479,7 +419,7 @@ function IndividualAssessment() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('proctors')
-        .select('*')
+        .select('id, name, email, managed_by, vendor, ptype, assessment_ready_attempt, at')
         .eq('assessment_ready', 'ready')
         .order('at', { ascending: false });
 
@@ -511,48 +451,17 @@ function IndividualAssessment() {
         if (scheduled <= now) throw new Error('Cannot schedule at a past time for today');
       }
 
-      const { data: prevRows, error: prevError } = await supabase
-        .from('proctor_evaluations')
-        .select('attempt_number')
-        .eq('proctor_id', selectedProctorData.id)
-        .eq('eval_type', 'assessment')
-        .order('attempt_number', { ascending: false })
-        .limit(1);
-
-      if (prevError) throw prevError;
-
-      const attempt = (prevRows?.[0]?.attempt_number || 0) + 1;
-      const scheduledAt = new Date().toISOString();
-
-      const { error: insertError } = await supabase.from('proctor_evaluations').insert({
-        id: crypto.randomUUID(),
-        proctor_id: selectedProctorData.id,
-        eval_type: 'assessment',
-        panel_user: panelUser,
-        scheduled_date: scheduledDate,
-        scheduled_time: scheduledTime,
-        score_out_of: Number(scoreOutOf),
-        result: null,
-        attempt_number: attempt,
-        comment: '',
-        created_at: scheduledAt,
-        created_by: user?.username || user?.email || 'system',
-        group_id: crypto.randomUUID(),
-        status: 'scheduled',
+      const { data: attempt, error: scheduleError } = await supabase.rpc('schedule_evaluation', {
+        p_proctor_id: selectedProctorData.id,
+        p_eval_type: 'assessment',
+        p_panel_user: panelUser,
+        p_scheduled_date: scheduledDate,
+        p_scheduled_time: scheduledTime,
+        p_score_out_of: Number(scoreOutOf),
+        p_group_id: crypto.randomUUID(),
       });
 
-      if (insertError) throw insertError;
-
-      const { error: updateError } = await supabase
-        .from('proctors')
-        .update({
-          assessment_ready: 'scheduled',
-          assessment_ready_attempt: attempt,
-          upd: scheduledAt,
-        })
-        .eq('id', selectedProctorData.id);
-
-      if (updateError) throw updateError;
+      if (scheduleError) throw scheduleError;
 
       await logAudit({
         action: 'Assessment Scheduled',
@@ -562,7 +471,7 @@ function IndividualAssessment() {
       });
     },
     onSuccess: async () => {
-      alert('Assessment scheduled successfully');
+      showAlert('Assessment scheduled successfully', { tone: 'success' });
       setSelectedProctor(null);
       setPanelUser('');
       setScheduledDate('');
@@ -573,7 +482,7 @@ function IndividualAssessment() {
       await queryClient.invalidateQueries({ queryKey: ['proctors'] });
     },
     onError: (error: any) => {
-      alert('Failed to schedule assessment: ' + error.message);
+      showAlert('Failed to schedule assessment: ' + error.message, { tone: 'error' });
     },
   });
 
@@ -592,13 +501,13 @@ function IndividualAssessment() {
 
   const exportReadyList = () => {
     if (filteredProctors.length === 0) {
-      alert('No proctors to export');
+      showAlert('No proctors to export', { tone: 'error' });
       return;
     }
 
     downloadCsv(
       `assessment_ready_list_${new Date().toISOString().slice(0, 10)}.csv`,
-      'Name,Managed By,Type,Assessment Status,Attempts',
+      ['Name', 'Vendor', 'Type', 'Assessment Status', 'Attempts'],
       filteredProctors.map((p) => [
         p.name || '',
         p.vendor || '',
@@ -609,41 +518,27 @@ function IndividualAssessment() {
     );
   };
 
-  const getVendorBadge = (vendor: string) => {
-    const vendorColors: Record<string, string> = {
-      'Sai': 'bg-blue-500/15 text-blue-400',
-      'TSN': 'bg-purple-500/15 text-purple-400',
-      'Avner': 'bg-emerald-400/15 text-emerald-400',
-      'A&M': 'bg-amber-500/15 text-amber-400',
-      'ATS': 'bg-red-400/15 text-red-400',
-      'Awign': 'bg-orange-400/15 text-orange-400',
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${vendorColors[vendor] || 'bg-accent/10 text-accent'}`}>
-        {vendor}
-      </span>
-    );
-  };
-
   return (
     <div>
       {/* Filters */}
       <div className="flex gap-2 mb-4 flex-wrap items-center">
         <Input
-          placeholder="🔍 Name, email..."
+          placeholder="Name, email..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 min-w-[180px]"
+          wrapperClassName="flex-1 min-w-[180px]"
         />
-        <Select
-          options={[
-            { value: '', label: 'All Managed By' },
-            ...managedByOptions,
-          ]}
-          value={vendorFilter}
-          onChange={(e) => setVendorFilter(e.target.value)}
-          className="min-w-[160px]"
-        />
+        {!isVendor && (
+          <Select
+            options={[
+              { value: '', label: 'All Vendors' },
+              ...managedByOptions,
+            ]}
+            value={vendorFilter}
+            onChange={(e) => setVendorFilter(e.target.value)}
+            wrapperClassName="min-w-[160px]"
+          />
+        )}
         <Select
           options={[
             { value: '', label: 'All Types' },
@@ -651,10 +546,18 @@ function IndividualAssessment() {
           ]}
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value)}
-          className="min-w-[120px]"
+          wrapperClassName="min-w-[120px]"
+        />
+        <ClearFiltersButton
+          show={!!(search || vendorFilter || typeFilter)}
+          onClick={() => {
+            setSearch('');
+            setVendorFilter('');
+            setTypeFilter('');
+          }}
         />
         <Button variant="ghost" size="sm" onClick={exportReadyList}>
-          ⬇ Export Ready List
+<Download className="w-3.5 h-3.5" /> Export Ready List
         </Button>
       </div>
 
@@ -683,16 +586,8 @@ function IndividualAssessment() {
               ),
               className: 'w-8',
             },
-            {
-              header: 'Name',
-              accessor: (proctor) => (
-                <span className="text-text font-semibold">{proctor.name}</span>
-              ),
-            },
-            {
-              header: 'Managed By',
-              accessor: (proctor) => getVendorBadge(proctor.vendor!),
-            },
+            { header: 'Name', accessor: (proctor) => proctor.name, className: 'text-[13px] text-text font-semibold' },
+            { header: 'Vendor', accessor: (proctor) => proctor.vendor, className: 'text-[12px] text-text2' },
             {
               header: 'Type',
               accessor: (proctor) => (
@@ -707,9 +602,8 @@ function IndividualAssessment() {
             },
             {
               header: 'Attempts',
-              accessor: (proctor) => (
-                <span className="text-[12px] text-text3">{proctor.assessment_ready_attempt || 0}</span>
-              ),
+              accessor: (proctor) => proctor.assessment_ready_attempt || 0,
+              className: 'text-[12px] text-text3',
             },
           ]}
         />
@@ -761,7 +655,7 @@ function IndividualAssessment() {
           </div>
           <div className="flex justify-end">
             <Button variant="primary" size="sm" onClick={() => scheduleMutation.mutate()} disabled={scheduleMutation.isPending}>
-              {scheduleMutation.isPending ? 'Scheduling...' : '✅ Schedule Assessment'}
+              {scheduleMutation.isPending ? 'Scheduling...' : <><CheckCircle2 className="w-4 h-4" /> Schedule Assessment</>}
             </Button>
           </div>
         </div>
@@ -797,25 +691,21 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
 
   const downloadTemplate = () => {
     if (!panelUser || !scheduledDate || !scheduledTime || !scoreOutOf || Number(scoreOutOf) < 1) {
-      alert('Select a Panel Coordinator, Scheduled Date, Time, and Score Out Of first');
+      showAlert('Select a Panel Coordinator, Scheduled Date, Time, and Score Out Of first', { tone: 'error' });
       return;
     }
     const ready = proctors;
     if (!ready.length) {
-      alert('No proctors with Assessment Ready status');
+      showAlert('No proctors with Assessment Ready status', { tone: 'error' });
       return;
     }
 
-    const BOM = '\uFEFF';
-    const header = 'email,proctor_name,managed_by,ptype';
-    const rows = ready.map((p) => `"${(p.email || '').replace(/"/g, '""')}","${(p.name || '').replace(/"/g, '""')}","${(p.vendor || '').replace(/"/g, '""')}","${(p.ptype || '').replace(/"/g, '""')}"`);
-    const blob = new Blob([BOM + header + '\n' + rows.join('\n')], { type: 'text/csv;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `assessment_assign_${scheduledDate}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    alert(`Downloaded ${ready.length} ready proctors. Delete rows you don't need, then upload the edited file back.`);
+    downloadCsv(
+      `assessment_assign_${scheduledDate}.csv`,
+      ['email', 'proctor_name', 'managed_by', 'ptype'],
+      ready.map((p) => [p.email || '', p.name || '', p.vendor || '', p.ptype || ''])
+    );
+    showAlert(`Downloaded ${ready.length} ready proctors. Delete rows you don't need, then upload the edited file back.`, { tone: 'success' });
     setBulkAssessConfig({
       panel: panelUser,
       date: scheduledDate,
@@ -830,7 +720,7 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
 
     const cfg = bulkAssessConfig;
     if (!cfg?.panel || !cfg?.date) {
-      alert('Download the Ready Proctors List first to set session config');
+      showAlert('Download the Ready Proctors List first to set session config', { tone: 'error' });
       e.target.value = '';
       return;
     }
@@ -838,14 +728,14 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
     const text = await file.text();
     const lines = text.trim().split('\n');
     if (lines.length < 2) {
-      alert('File appears empty');
+      showAlert('File appears empty', { tone: 'error' });
       return;
     }
 
     const header = lines[0].split(',').map((h) => h.trim().toLowerCase().replace(/"/g, ''));
     const emailIdx = header.indexOf('email');
     if (emailIdx < 0) {
-      alert('CSV must have an email column');
+      showAlert('CSV must have an email column', { tone: 'error' });
       return;
     }
 
@@ -862,48 +752,27 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
 
     const validRows = rows.filter((r) => r._ok);
     if (!validRows.length) {
-      alert('Nothing to import');
+      showAlert('Nothing to import', { tone: 'error' });
       return;
     }
 
-    const now = new Date().toISOString();
+    // One group_id shared by every candidate in this batch -- this is what makes the
+    // upload a single group schedule (one shared session other coordinators/admins can
+    // open as one unit in Workspace) rather than N unrelated individual schedules. Each
+    // candidate still gets their own proctor_evaluations row/attempt/history; group_id
+    // only ties them together as one session.
+    const groupId = crypto.randomUUID();
     await Promise.all(validRows.map(async (row) => {
-      const attemptRow = await supabase
-        .from('proctor_evaluations')
-        .select('attempt_number')
-        .eq('proctor_id', row.proctor!.id)
-        .eq('eval_type', 'assessment')
-        .order('attempt_number', { ascending: false })
-        .limit(1);
-
-      if (attemptRow.error) throw attemptRow.error;
-      const attempt = (attemptRow.data?.[0]?.attempt_number || 0) + 1;
-      const groupId = crypto.randomUUID();
-
-      const insertRes = await supabase.from('proctor_evaluations').insert({
-        id: crypto.randomUUID(),
-        proctor_id: row.proctor!.id,
-        eval_type: 'assessment',
-        panel_user: cfg.panel,
-        scheduled_date: cfg.date,
-        scheduled_time: cfg.time,
-        score_out_of: cfg.score,
-        group_id: groupId,
-        result: null,
-        attempt_number: attempt,
-        comment: '',
-        created_at: now,
-        created_by: 'system',
-        status: 'scheduled',
+      const { data: attempt, error: scheduleError } = await supabase.rpc('schedule_evaluation', {
+        p_proctor_id: row.proctor!.id,
+        p_eval_type: 'assessment',
+        p_panel_user: cfg.panel,
+        p_scheduled_date: cfg.date,
+        p_scheduled_time: cfg.time,
+        p_score_out_of: cfg.score,
+        p_group_id: groupId,
       });
-      if (insertRes.error) throw insertRes.error;
-
-      const updRes = await supabase.from('proctors').update({
-        assessment_ready: 'scheduled',
-        assessment_ready_attempt: attempt,
-        upd: now,
-      }).eq('id', row.proctor!.id);
-      if (updRes.error) throw updRes.error;
+      if (scheduleError) throw scheduleError;
 
       await logAudit({
         action: 'Assessment Scheduled (Multi)',
@@ -913,12 +782,12 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
       });
     }));
 
-    alert(`${validRows.length} assessment(s) scheduled for ${cfg.panel}`);
+    showAlert(`${validRows.length} assessment(s) scheduled for ${cfg.panel}`, { tone: 'success' });
     e.target.value = '';
   };
 
   return (
-    <Card className="p-6 max-w-3xl">
+    <div className="bg-surface border border-border rounded-lg p-6 max-w-3xl">
       <h3 className="text-sm font-semibold text-text uppercase tracking-wide mb-2">
         Step 1 — Configure Session
       </h3>
@@ -972,14 +841,14 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
 
       <div className="flex gap-2 flex-wrap">
         <Button variant="primary" size="sm" onClick={downloadTemplate}>
-          ⬇ Download Ready Proctors List
+          <Download className="w-3.5 h-3.5" /> Download Ready Proctors List
         </Button>
         <Button
           variant="ghost"
           size="sm"
           onClick={() => uploadInputRef.current?.click()}
         >
-          📤 Upload Edited List
+          <Upload className="w-3.5 h-3.5" /> Upload Edited List
         </Button>
         <input
           ref={uploadInputRef}
@@ -989,7 +858,7 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
           onChange={uploadTemplate}
         />
       </div>
-    </Card>
+    </div>
   );
 }
 
@@ -999,27 +868,15 @@ function ResultsTab() {
   return (
     <div>
       {/* Sub Tabs */}
-      <div className="flex gap-2 mb-4 border-b border-border">
-        <button
-          className={`px-3 py-2 text-xs font-medium transition-colors ${
-            subTab === 0
-              ? 'text-accent border-b-2 border-accent'
-              : 'text-text3 hover:text-text'
-          }`}
-          onClick={() => setSubTab(0)}
-        >
-          🎭 Demo Results
-        </button>
-        <button
-          className={`px-3 py-2 text-xs font-medium transition-colors ${
-            subTab === 1
-              ? 'text-accent border-b-2 border-accent'
-              : 'text-text3 hover:text-text'
-          }`}
-          onClick={() => setSubTab(1)}
-        >
-          📝 Assessment Results
-        </button>
+      <div className="mb-4">
+        <CompactSegmentedTabs
+          options={[
+            { label: 'Demo Results', value: 0, icon: Video },
+            { label: 'Assessment Results', value: 1, icon: FileEdit },
+          ]}
+          value={subTab}
+          onChange={setSubTab}
+        />
       </div>
 
       {subTab === 0 ? <ResultsTable type="demo" /> : <ResultsTable type="assessment" />}
@@ -1034,72 +891,77 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
   const [resultFilter, setResultFilter] = useState('');
   const [vendorFilter, setVendorFilter] = useState('');
   const [overrideEvaluation, setOverrideEvaluation] = useState<any | null>(null);
+  const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 25;
   const { data: managedByOptions = [] } = useManagedByOptions();
 
   const isAdmin = user?.role === 'admin';
+  const isVendor = user?.role === 'vendor';
 
-  // Fetch evaluations with results
-  const { data: evaluations = [], isLoading } = useQuery({
-    queryKey: ['evaluations-results', type],
-    queryFn: async () => {
-      const { data: evalData, error: evalError } = await supabase
-        .from('proctor_evaluations')
-        .select('*')
-        .eq('eval_type', type)
-        .not('result', 'is', null)
-        .order('created_at', { ascending: false });
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(t);
+  }, [search]);
 
-      if (evalError) throw evalError;
-
-      // Fetch all proctors to join with evaluations
-      const { data: proctorsData, error: proctorsError } = await supabase
-        .from('proctors')
-        .select('id, name, email, vendor, managed_by');
-
-      if (proctorsError) throw proctorsError;
-
-      // Create proctor lookup map
-      const proctorMap = new Map(
-        (proctorsData as any[]).map(p => [p.id, { ...p, vendor: p.managed_by || p.vendor }])
-      );
-
-      // Join evaluations with proctor data
-      return (evalData as Evaluation[]).map(e => {
-        const proctor = proctorMap.get(e.proctor_id);
-        return {
-          ...e,
-          proctor_name: proctor?.name || 'Unknown',
-          proctor_email: proctor?.email || '',
-          proctor_vendor: proctor?.vendor || '—',
-          proctor_type: proctor?.ptype || '—',
-        };
-      });
+  // One row per proctor's LATEST attempt for this eval_type, with earlier attempts
+  // already nested as `history` -- both done server-side by the
+  // latest_evaluation_per_proctor view (migration 0043/0044), so a candidate who
+  // failed once and passed on retry still shows as one row, not two, and this can
+  // now be paginated correctly (a plain client-side group-by over a full fetch
+  // couldn't be, since a page boundary would split one proctor's attempts across
+  // pages instead of splitting between proctors).
+  const { data: pageResult, isLoading, isFetching } = usePaginatedQuery<any>({
+    queryKey: ['evaluations-results', type, resultFilter, vendorFilter],
+    table: 'latest_evaluation_per_proctor',
+    filters: (q) => {
+      let query = q.eq('eval_type', type);
+      if (resultFilter) query = query.eq('result', resultFilter);
+      if (vendorFilter) query = query.eq('proctor_vendor', vendorFilter);
+      return query;
     },
+    searchColumns: ['proctor_name', 'proctor_email'],
+    searchTerm: debouncedSearch,
+    page,
+    pageSize: PAGE_SIZE,
+    orderBy: { column: 'created_at', ascending: false },
+    countMode: 'estimated',
   });
 
-  // Filter evaluations
-  const filteredEvaluations = evaluations.filter((e: any) => {
-    if (search) {
-      const s = search.toLowerCase();
-      if (!(e.proctor_name || '').toLowerCase().includes(s) && !(e.proctor_email || '').toLowerCase().includes(s)) {
-        return false;
-      }
+  const pagedEvaluations = pageResult?.data ?? [];
+  const totalCount = pageResult?.count ?? 0;
+
+  const toggleHistory = (id: string) => {
+    setExpandedHistory((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const exportResults = async () => {
+    // Exports every matching row, not just the current page -- re-runs the same
+    // filters against the view with no .range().
+    let query = supabase.from('latest_evaluation_per_proctor').select('*').eq('eval_type', type).order('created_at', { ascending: false });
+    if (resultFilter) query = query.eq('result', resultFilter);
+    if (vendorFilter) query = query.eq('proctor_vendor', vendorFilter);
+    if (debouncedSearch.trim()) {
+      const term = debouncedSearch.trim();
+      query = query.or(`proctor_name.ilike.%${term}%,proctor_email.ilike.%${term}%`);
     }
-    if (resultFilter && e.result !== resultFilter) return false;
-    if (vendorFilter && e.proctor_vendor !== vendorFilter) return false;
-    return true;
-  });
-
-  const exportResults = () => {
-    if (filteredEvaluations.length === 0) {
-      alert(`No ${type} results to export`);
+    const { data, error } = await query;
+    if (error) return showAlert('Failed to export: ' + error.message, { tone: 'error' });
+    if (!data || data.length === 0) {
+      showAlert(`No ${type} results to export`, { tone: 'error' });
       return;
     }
 
     downloadCsv(
       `eval_${type}_${new Date().toISOString().slice(0, 10)}.csv`,
-      'Proctor Name,Email,Vendor,Proctor Type,Eval Type,Panel,Scheduled Date,Attempt,Result,Comment,Certified Date',
-      filteredEvaluations.map((evaluation: any) => [
+      ['Proctor Name', 'Email', 'Vendor', 'Proctor Type', 'Eval Type', 'Panel', 'Scheduled Date', 'Attempt', 'Result', 'Comment', 'Certified Date'],
+      (data as any[]).map((evaluation) => [
         evaluation.proctor_name || '—',
         evaluation.proctor_email || '—',
         evaluation.proctor_vendor || '—',
@@ -1122,7 +984,7 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
     return time ? `${dateStr} ${time}` : dateStr;
   };
 
-  const getResultBadge = (result?: string, overriddenBy?: string) => {
+  const getResultBadge = (result?: string, overriddenBy?: string, overriddenAt?: string) => {
     const colors: Record<string, string> = {
       'Pass': 'text-success',
       'Fail': 'text-danger',
@@ -1130,17 +992,20 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
       'No Show': 'text-text3',
       'Reschedule': 'text-warning',
     };
+    const overriddenWhen = overriddenAt
+      ? new Date(overriddenAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
+      : null;
     return (
       <span className="flex items-center gap-1">
         <span className={`text-[12px] font-bold ${colors[result || ''] || 'text-text3'}`}>
           {result || '—'}
         </span>
         {overriddenBy && (
-          <span 
-            className="text-[10px] font-bold text-warning" 
-            title={`Overridden by ${overriddenBy}`}
+          <span
+            className="inline-flex items-center gap-0.5 text-[10px] font-bold text-warning"
+            title={overriddenWhen ? `Overridden by ${overriddenBy} on ${overriddenWhen}` : `Overridden by ${overriddenBy}`}
           >
-            ⚠️OVR
+            <AlertTriangle className="w-3 h-3" />OVR
           </span>
         )}
       </span>
@@ -1156,10 +1021,13 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
       {/* Filters */}
       <div className="flex gap-2 mb-4 flex-wrap items-center">
         <Input
-          placeholder="🔍 Name, email..."
+          placeholder="Name, email..."
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="flex-1 min-w-[180px]"
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setPage(1);
+          }}
+          wrapperClassName="flex-1 min-w-[180px]"
         />
         <Select
           options={[
@@ -1170,107 +1038,194 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
             { value: 'Reschedule', label: 'Reschedule' },
           ]}
           value={resultFilter}
-          onChange={(e) => setResultFilter(e.target.value)}
-          className="min-w-[140px]"
+          onChange={(e) => {
+            setResultFilter(e.target.value);
+            setPage(1);
+          }}
+          wrapperClassName="min-w-[140px]"
         />
-        <Select
-          options={[
-            { value: '', label: 'All Managed By' },
-            ...managedByOptions,
-          ]}
-          value={vendorFilter}
-          onChange={(e) => setVendorFilter(e.target.value)}
-          className="min-w-[160px]"
+        {!isVendor && (
+          <Select
+            options={[
+              { value: '', label: 'All Vendors' },
+              ...managedByOptions,
+            ]}
+            value={vendorFilter}
+            onChange={(e) => {
+              setVendorFilter(e.target.value);
+              setPage(1);
+            }}
+            wrapperClassName="min-w-[160px]"
+          />
+        )}
+        <ClearFiltersButton
+          show={!!(search || resultFilter || vendorFilter)}
+          onClick={() => {
+            setSearch('');
+            setResultFilter('');
+            setVendorFilter('');
+            setPage(1);
+          }}
         />
         <Button variant="ghost" size="sm" onClick={exportResults}>
-          ⬇ Export
+<Download className="w-3.5 h-3.5" /> Export
         </Button>
       </div>
 
       {/* Table */}
       <Table
-        data={filteredEvaluations}
+        data={pagedEvaluations}
         isLoading={isLoading}
         emptyMessage={`No ${type} results recorded yet`}
+        pagination={{ page, pageSize: PAGE_SIZE, count: totalCount, isFetching, onPageChange: setPage }}
         columns={[
           {
             header: 'Proctor',
-            accessor: (evaluation: any) => (
+            accessor: (evaluation) => (
               <div>
                 <div className="text-[13px] text-text font-semibold">{evaluation.proctor_name}</div>
                 <div className="text-[11px] text-text3">{evaluation.proctor_vendor}</div>
               </div>
             ),
           },
-          {
-            header: 'Panel',
-            accessor: (evaluation: any) => (
-              <span className="text-[12px] text-text2">{evaluation.panel_user || '—'}</span>
-            ),
-          },
+          { header: 'Panel', accessor: (evaluation) => evaluation.panel_user || '—', className: 'text-[12px] text-text2' },
           {
             header: 'Scheduled',
-            accessor: (evaluation: any) => (
-              <span className="text-[12px] text-text3">
-                {formatDateTime(evaluation.scheduled_date, evaluation.scheduled_time)}
-              </span>
-            ),
+            accessor: (evaluation) => formatDateTime(evaluation.scheduled_date, evaluation.scheduled_time),
+            className: 'text-[12px] text-text3',
           },
           {
             header: 'Score',
-            accessor: (evaluation: any) => (
-              <span className="font-mono text-[12px] text-text2">
-                {evaluation.score_obtained != null
-                  ? `${evaluation.score_obtained}${evaluation.score_out_of ? '/' + evaluation.score_out_of : ''}`
-                  : '—'}
-              </span>
-            ),
+            accessor: (evaluation) =>
+              evaluation.score_obtained != null
+                ? `${evaluation.score_obtained}${evaluation.score_out_of ? '/' + evaluation.score_out_of : ''}`
+                : '—',
+            className: 'font-mono text-[12px] text-text2',
           },
           {
             header: 'Certified Date',
-            accessor: (evaluation: any) => (
-              <span className="text-[12px] text-success">
-                {evaluation.result === 'Pass'
-                  ? formatDateTime(evaluation.certified_date || evaluation.scheduled_date)
-                  : '—'}
-              </span>
-            ),
+            accessor: (evaluation) =>
+              evaluation.result === 'Pass'
+                ? formatDateTime(evaluation.certified_date || evaluation.scheduled_date)
+                : '—',
+            className: 'text-[12px] text-success',
           },
           {
             header: 'Attempt',
-            accessor: (evaluation: any) => (
-              <span className="px-2 py-0.5 rounded bg-accent/10 text-accent text-[10px] font-bold">
-                #{evaluation.attempt_number || 1}
-              </span>
-            ),
+            accessor: (evaluation) => {
+              const history = evaluation.history || [];
+              const hasHistory = history.length > 0;
+              const isExpanded = expandedHistory.has(evaluation.id);
+              return (
+                <div className="flex items-center gap-1">
+                  <span className="px-2 py-0.5 rounded bg-accent/10 text-accent text-[10px] font-bold">
+                    #{evaluation.attempt_number || 1}
+                  </span>
+                  {hasHistory && (
+                    <button
+                      onClick={() => toggleHistory(evaluation.id)}
+                      title={`${history.length} earlier attempt${history.length === 1 ? '' : 's'}`}
+                      className="inline-flex items-center gap-0.5 text-text3 hover:text-accent text-[10px] font-semibold"
+                    >
+                      <History className="w-3 h-3" />
+                      {history.length}
+                      <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                    </button>
+                  )}
+                </div>
+              );
+            },
           },
           {
             header: 'Result',
-            accessor: (evaluation: any) => getResultBadge(evaluation.result, evaluation.overridden_by),
+            accessor: (evaluation) => (
+              <div className="flex items-center gap-1.5">
+                {getResultBadge(evaluation.result, evaluation.overridden_by, evaluation.overridden_at)}
+                {evaluation.result_url && (
+                  <a
+                    href={evaluation.result_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    title="Open evidence"
+                    className="text-text3 hover:text-accent"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                )}
+              </div>
+            ),
           },
           {
             header: 'Comment',
-            accessor: (evaluation: any) => (
-              <span className="text-[12px] text-text2">{evaluation.comment || '—'}</span>
-            ),
-            className: 'max-w-xs truncate',
+            accessor: (evaluation) => evaluation.comment || '—',
+            className: 'text-[12px] text-text2 max-w-xs truncate',
           },
           {
             header: 'Actions',
-            accessor: (evaluation: any) =>
+            accessor: (evaluation) =>
               isAdmin ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleOverride(evaluation)}
-                >
-                  🔄 Override
+                <Button variant="ghost" size="sm" onClick={() => handleOverride(evaluation)}>
+                  <RefreshCw className="w-3.5 h-3.5" /> Override
                 </Button>
               ) : (
                 <span className="text-text3 text-[11px]">Recorded</span>
               ),
           },
         ]}
+        renderExpandedRow={(evaluation) =>
+          expandedHistory.has(evaluation.id) &&
+          (evaluation.history || []).map((past: any) => (
+            <tr key={past.id} className="border-b border-border bg-surface2/40">
+              <td className="px-3.5 py-2 pl-8 text-[11px] text-text3 italic" colSpan={2}>
+                Earlier attempt
+              </td>
+              <td className="px-3.5 py-2 text-[12px] text-text3">
+                {formatDateTime(past.scheduled_date, past.scheduled_time)}
+              </td>
+              <td className="px-3.5 py-2 font-mono text-[12px] text-text2">
+                {past.score_obtained != null
+                  ? `${past.score_obtained}${past.score_out_of ? '/' + past.score_out_of : ''}`
+                  : '—'}
+              </td>
+              <td className="px-3.5 py-2 text-[12px] text-success">
+                {past.result === 'Pass' ? formatDateTime(past.certified_date || past.scheduled_date) : '—'}
+              </td>
+              <td className="px-3.5 py-2">
+                <span className="px-2 py-0.5 rounded bg-surface text-text3 text-[10px] font-bold">
+                  #{past.attempt_number || 1}
+                </span>
+              </td>
+              <td className="px-3.5 py-2">
+                <div className="flex items-center gap-1.5">
+                  {getResultBadge(past.result, past.overridden_by, past.overridden_at)}
+                  {past.result_url && (
+                    <a
+                      href={past.result_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="Open evidence"
+                      className="text-text3 hover:text-accent"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  )}
+                </div>
+              </td>
+              <td className="px-3.5 py-2 text-[12px] text-text2 max-w-xs truncate">
+                {past.comment || '—'}
+              </td>
+              <td className="px-3.5 py-2">
+                {/* Superseded attempt -- not editable here. Overriding it would call the
+                    same RPC that sets the proctor's live demo_ready/assessment_ready
+                    status from whatever gets submitted, so "correcting" an old attempt
+                    could silently stomp the status the current (latest) attempt set. */}
+                <span className="text-text3 text-[11px]" title="Only the latest attempt can be overridden">
+                  Superseded
+                </span>
+              </td>
+            </tr>
+          ))
+        }
       />
 
       {/* Override Modal */}
@@ -1299,17 +1254,43 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
   const { user } = useAuthStore();
   const [result, setResult] = useState(evaluation.result || '');
   const [score, setScore] = useState(evaluation.score_obtained != null ? evaluation.score_obtained.toString() : '');
-  const [comment, setComment] = useState(evaluation.comment || '');
+  const [reason, setReason] = useState(evaluation.comment || '');
+  const [reasonOther, setReasonOther] = useState('');
+  const [sessionCode, setSessionCode] = useState(evaluation.session_code || '');
+  const [candidateId, setCandidateId] = useState(evaluation.candidate_id || '');
+  const [sectionId, setSectionId] = useState(evaluation.section_id || '');
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const needsEvidence = result && result !== 'No Show';
+  const previewUrl =
+    !needsEvidence ? '' :
+    evaluation.eval_type === 'demo'
+      ? (sessionCode ? `https://recruit.talview.com/recruiter/live-session/${sessionCode}` : '')
+      : (candidateId && sectionId ? `https://recruit.talview.com/recruiter/invites/${candidateId}/assessment-section/${sectionId}/answers` : '');
+
+  const reasonOptions = result ? [...(EVAL_REASON_OPTIONS_BY_RESULT[result] || []), 'Other'] : [];
+  const comment = reason === 'Other' ? reasonOther : reason;
 
   const overrideMutation = useMutation({
     mutationFn: async () => {
       const newErrors: Record<string, string> = {};
-      
+
       if (!result) newErrors.result = 'Result is required';
       if (!score || isNaN(Number(score))) newErrors.score = 'Score is required';
+      else if (Number(score) < 0) newErrors.score = 'Score cannot be negative';
+      else if (evaluation.score_out_of && Number(score) > evaluation.score_out_of) {
+        newErrors.score = `Score cannot exceed ${evaluation.score_out_of}`;
+      }
       if (['Reattempt', 'Reschedule'].includes(result) && !comment) {
-        newErrors.comment = 'Comment is required for ' + result;
+        newErrors.comment = 'Reason is required for ' + result;
+      }
+      if (needsEvidence) {
+        if (evaluation.eval_type === 'demo') {
+          if (!sessionCode.trim()) newErrors.sessionCode = 'Session Code is required';
+        } else {
+          if (!candidateId.trim()) newErrors.candidateId = 'Candidate ID is required';
+          if (!sectionId.trim()) newErrors.sectionId = 'Section ID is required';
+        }
       }
 
       if (Object.keys(newErrors).length > 0) {
@@ -1317,55 +1298,45 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
         throw new Error('Validation failed');
       }
 
-      const now = new Date().toISOString();
-      const certDate = result === 'Pass' ? new Date().toISOString().slice(0, 10) : null;
-      
-      // Update evaluation
-      const { error: evalError } = await supabase
-        .from('proctor_evaluations')
-        .update({
-          result,
-          score_obtained: Number(score),
-          comment,
-          certified_date: certDate,
-          overridden_by: user?.username,
-          overridden_at: now,
-        })
-        .eq('id', evaluation.id);
+      const { error: evalError } = await supabase.rpc('submit_evaluation_result', {
+        p_evaluation_id: evaluation.id,
+        p_result: result,
+        p_score: Number(score),
+        p_comment: comment,
+        p_session_code: evaluation.eval_type === 'demo' ? sessionCode.trim() : null,
+        p_candidate_id: evaluation.eval_type !== 'demo' ? candidateId.trim() : null,
+        p_section_id: evaluation.eval_type !== 'demo' ? sectionId.trim() : null,
+      });
 
       if (evalError) throw evalError;
 
-      // Update proctor ready status
-      const readyField = evaluation.eval_type === 'demo' ? 'demo_ready' : 'assessment_ready';
-      const evalField = evaluation.eval_type === 'demo' ? 'demo_eval' : 'assessment';
-      const readyVal = result === 'Pass' ? 'pass' : result === 'No Show' ? 'noshow' : result === 'Reschedule' ? 'reschedule' : 'reattempt';
-      const evalVal = result === 'Pass' ? 'Pass' : 'Pending';
-
-      const { error: proctorError } = await supabase
-        .from('proctors')
-        .update({
-          [readyField]: readyVal,
-          [evalField]: evalVal,
-          upd: now,
-        })
-        .eq('id', evaluation.proctor_id);
-
-      if (proctorError) throw proctorError;
+      // Note the before -> after values for the fields that can be corrected on a
+      // resubmission, so the audit trail shows what changed, not just the new state.
+      const isCorrection = !!evaluation.result;
+      const fieldChange = (label: string, before: any, after: any) => {
+        const b = before ?? '';
+        const a = after ?? '';
+        if (!isCorrection || b === a) return a ? ` · ${label}: ${a}` : '';
+        return ` · ${label}: "${b || '(none)'}" -> "${a || '(none)'}"`;
+      };
+      const evidenceNote = evaluation.eval_type === 'demo'
+        ? fieldChange('Session Code', evaluation.session_code, sessionCode)
+        : fieldChange('Candidate ID', evaluation.candidate_id, candidateId) + fieldChange('Section ID', evaluation.section_id, sectionId);
 
       await logAudit({
         action: evaluation.result ? 'Eval Override' : 'Eval Result',
         target: evaluation.proctor_name,
-        detail: `${evaluation.eval_type} Attempt #${evaluation.attempt_number}: ${result}${comment ? ` — ${comment}` : ''}${evaluation.result ? ` [overrides: ${evaluation.result}]` : ''} · by ${user?.username || user?.name || 'system'}`,
+        detail: `${evaluation.eval_type} Attempt #${evaluation.attempt_number}: ${result}${comment ? ` — ${comment}` : ''}${evidenceNote}${evaluation.result ? ` [overrides: ${evaluation.result}]` : ''} · by ${user?.username || user?.name || 'system'}`,
         user: user?.username || user?.name || null,
       });
     },
     onSuccess: () => {
-      alert('Result overridden successfully');
+      showAlert('Result overridden successfully', { tone: 'success' });
       onSuccess();
     },
     onError: (error: any) => {
       if (error.message !== 'Validation failed') {
-        alert('Failed to override: ' + error.message);
+        showAlert('Failed to override: ' + error.message, { tone: 'error' });
       }
     },
   });
@@ -1390,8 +1361,9 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
             {evaluation.score_out_of && ` · Score out of: ${evaluation.score_out_of}`}
           </div>
           {evaluation.result && (
-            <div className="bg-warning/10 border border-warning/30 rounded-lg p-2 mt-2">
-              ⚠️ Result already submitted as <strong>{evaluation.result}</strong>. Admin override will be logged.
+            <div className="bg-warning/10 border border-warning/30 rounded-lg p-2 mt-2 flex items-start gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <span>Result already submitted as <strong>{evaluation.result}</strong>. Admin override will be logged.</span>
             </div>
           )}
         </div>
@@ -1413,6 +1385,8 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
               value={result}
               onChange={(e) => {
                 setResult(e.target.value);
+                setReason('');
+                setReasonOther('');
                 setErrors({ ...errors, result: '' });
               }}
             />
@@ -1427,6 +1401,7 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
               type="number"
               placeholder="Enter score..."
               min={0}
+              max={evaluation.score_out_of || undefined}
               value={score}
               onChange={(e) => {
                 setScore(e.target.value);
@@ -1437,20 +1412,98 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
           </div>
         </div>
 
+        {needsEvidence && (
+          <div className="bg-surface2 border border-border rounded-lg p-3">
+            <div className="text-xs font-semibold text-text mb-2">
+              Evidence <span className="text-text3 font-normal normal-case">(builds the result URL automatically)</span>
+            </div>
+            {evaluation.eval_type === 'demo' ? (
+              <div>
+                <label className="block text-[11px] font-semibold text-text2 mb-1">
+                  Session Code <span className="text-danger">*</span>
+                </label>
+                <Input
+                  placeholder="e.g. abc123"
+                  value={sessionCode}
+                  onChange={(e) => {
+                    setSessionCode(e.target.value);
+                    setErrors({ ...errors, sessionCode: '' });
+                  }}
+                />
+                {errors.sessionCode && <div className="text-danger text-xs mt-1">{errors.sessionCode}</div>}
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-text2 mb-1">
+                    Candidate ID <span className="text-danger">*</span>
+                  </label>
+                  <Input
+                    placeholder="e.g. 12345"
+                    value={candidateId}
+                    onChange={(e) => {
+                      setCandidateId(e.target.value);
+                      setErrors({ ...errors, candidateId: '' });
+                    }}
+                  />
+                  {errors.candidateId && <div className="text-danger text-xs mt-1">{errors.candidateId}</div>}
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-text2 mb-1">
+                    Section ID <span className="text-danger">*</span>
+                  </label>
+                  <Input
+                    placeholder="e.g. 67890"
+                    value={sectionId}
+                    onChange={(e) => {
+                      setSectionId(e.target.value);
+                      setErrors({ ...errors, sectionId: '' });
+                    }}
+                  />
+                  {errors.sectionId && <div className="text-danger text-xs mt-1">{errors.sectionId}</div>}
+                </div>
+              </div>
+            )}
+            {previewUrl && (
+              <a
+                href={previewUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-[11px] text-accent font-semibold hover:underline mt-2 truncate max-w-full"
+              >
+                {previewUrl}
+              </a>
+            )}
+          </div>
+        )}
+
         <div>
           <label className="block text-xs font-semibold text-text mb-1">
-            Comment {['Reattempt', 'Reschedule'].includes(result) && <span className="text-danger">*</span>}
+            Reason {['Reattempt', 'Reschedule'].includes(result) && <span className="text-danger">*</span>}
           </label>
-          <textarea
-            value={comment}
+          <Select
+            options={[
+              { value: '', label: 'Select reason...' },
+              ...reasonOptions.map((r) => ({ value: r, label: r })),
+            ]}
+            value={reason}
             onChange={(e) => {
-              setComment(e.target.value);
+              setReason(e.target.value);
               setErrors({ ...errors, comment: '' });
             }}
-            placeholder="Additional notes..."
-            rows={3}
-            className="w-full px-3 py-2 bg-surface2 border border-border rounded-lg text-xs text-text outline-none focus:border-accent resize-none"
           />
+          {reason === 'Other' && (
+            <textarea
+              value={reasonOther}
+              onChange={(e) => {
+                setReasonOther(e.target.value);
+                setErrors({ ...errors, comment: '' });
+              }}
+              placeholder="Enter reason..."
+              rows={3}
+              className="w-full mt-2 px-3 py-2 bg-surface2 border border-border rounded-lg text-xs text-text outline-none focus:border-accent resize-none"
+            />
+          )}
           {errors.comment && <div className="text-danger text-xs mt-1">{errors.comment}</div>}
         </div>
 
@@ -1464,7 +1517,7 @@ function OverrideModal({ evaluation, onClose, onSuccess }: OverrideModalProps) {
             onClick={() => overrideMutation.mutate()}
             disabled={overrideMutation.isPending}
           >
-            💾 Submit Evaluation
+            <Save className="w-4 h-4" /> Submit Evaluation
           </Button>
         </div>
       </div>

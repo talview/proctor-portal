@@ -16,8 +16,8 @@ export default function Badge({ status }: BadgeProps) {
   return (
     <span
       className={`
-        inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full
-        text-[11px] font-bold border
+        inline-flex items-center justify-center gap-1.5 px-2.5 py-1 rounded-full
+        min-w-[98px] text-[11px] font-bold border
         ${statusStyles[status]}
       `}
     >

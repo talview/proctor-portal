@@ -1,11 +1,13 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Pencil, Trash2, Save, AlertTriangle, ArrowUpCircle } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
 import Input from '@/components/ui/Input';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Card from '@/components/ui/Card';
+import Table from '@/components/ui/Table';
+import { showAlert, showConfirm } from '@/components/ui/GlobalDialog';
 
 interface Customer {
   id: string;
@@ -34,7 +36,6 @@ const SESSION_COLORS: Record<string, string> = {
 };
 
 export default function CustomersPage() {
-  const { user } = useAuthStore();
   const queryClient = useQueryClient();
   const [showModal, setShowModal] = useState(false);
   const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
@@ -89,22 +90,21 @@ export default function CustomersPage() {
       if (error) throw error;
     },
     onSuccess: (_, customer) => {
-      alert(`Customer "${customer.name}" deleted`);
+      showAlert(`Customer "${customer.name}" deleted`, { tone: 'success' });
       queryClient.invalidateQueries({ queryKey: ['customers'] });
       queryClient.invalidateQueries({ queryKey: ['certifications'] });
     },
     onError: (error: any) => {
-      alert('Failed to delete: ' + error.message);
+      showAlert('Failed to delete: ' + error.message, { tone: 'error' });
     },
   });
 
-  const handleDeleteCustomer = (customer: Customer) => {
-    if (
-      !confirm(
-        `Delete "${customer.name}"? This will also delete all certifications for this customer. This cannot be undone.`
-      )
-    )
-      return;
+  const handleDeleteCustomer = async (customer: Customer) => {
+    const ok = await showConfirm(
+      `Delete "${customer.name}"? This will also delete all certifications for this customer. This cannot be undone.`,
+      { danger: true }
+    );
+    if (!ok) return;
     deleteMutation.mutate(customer);
   };
 
@@ -118,18 +118,6 @@ export default function CustomersPage() {
     });
   };
 
-  if (user?.role !== 'admin') {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <div className="text-4xl mb-2">🔒</div>
-          <h3 className="text-lg font-semibold text-text mb-1">Admin Access Only</h3>
-          <p className="text-text3 text-sm">This page is only accessible to administrators.</p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div>
       {/* Header */}
@@ -140,84 +128,64 @@ export default function CustomersPage() {
       </div>
 
       {/* Customer List */}
-      {isLoading ? (
-        <div className="flex items-center justify-center h-64">
-          <div className="text-center">
-            <div className="text-4xl mb-2">⏳</div>
-            <h3 className="text-lg font-semibold text-text">Loading customers...</h3>
-          </div>
-        </div>
-      ) : customers.length === 0 ? (
-        <div className="flex items-center justify-center h-64">
-          <div className="text-center">
-            <div className="text-4xl mb-2">🏢</div>
-            <h3 className="text-lg font-semibold text-text mb-1">No customers yet</h3>
-            <p className="text-text3 text-sm">
-              Add your first customer to start managing certifications.
-            </p>
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {customers.map((customer) => (
-            <Card
-              key={customer.id}
-              className="p-4 flex items-center gap-4"
-            >
-              {/* Version Badge */}
-              <div className="text-center min-w-[56px]">
-                <div className="text-[10px] font-bold text-text3 uppercase tracking-wider mb-1">
-                  SOP
-                </div>
-                <div className="text-2xl font-bold text-accent">
-                  v{customer.current_version}
-                </div>
-              </div>
-
-              {/* Customer Info */}
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <div className="text-base font-bold text-text">{customer.name}</div>
+      <Table
+        data={customers}
+        isLoading={isLoading}
+        emptyMessage="No customers yet. Add your first customer to start managing certifications."
+        columns={[
+          {
+            header: 'Customer',
+            accessor: (customer) => (
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-text">{customer.name}</span>
                   <span className="font-mono text-[11px] font-bold px-2 py-0.5 rounded bg-accent/15 text-accent">
                     {customer.org_id || 'No Org ID'}
                   </span>
                 </div>
-                <div className="flex items-center gap-1.5 flex-wrap mb-1">
-                  {customer.session_type && customer.session_type.length > 0 ? (
-                    customer.session_type.map((type) => (
-                      <span
-                        key={type}
-                        className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${
-                          SESSION_COLORS[type] || 'bg-surface2 text-text3'
-                        }`}
-                      >
-                        {type}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="text-[11px] text-text3">No session type set</span>
-                  )}
-                </div>
-                <div className="text-[11px] text-text3">
+                <div className="text-[11px] text-text3 mt-0.5">
                   Added {formatDate(customer.created_at)} · by {customer.created_by || '—'}
                 </div>
               </div>
-
-              {/* Actions */}
-              <div className="flex gap-2">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleBumpVersion(customer)}
-                >
-                  ⬆ Bump SOP
+            ),
+          },
+          {
+            header: 'SOP Version',
+            accessor: (customer) => (
+              <span className="text-lg font-bold text-accent">v{customer.current_version}</span>
+            ),
+          },
+          {
+            header: 'Session Types',
+            accessor: (customer) => (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {customer.session_type && customer.session_type.length > 0 ? (
+                  customer.session_type.map((type) => (
+                    <span
+                      key={type}
+                      className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${
+                        SESSION_COLORS[type] || 'bg-surface2 text-text3'
+                      }`}
+                    >
+                      {type}
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-[11px] text-text3">No session type set</span>
+                )}
+              </div>
+            ),
+          },
+          {
+            header: 'Actions',
+            className: 'text-right',
+            accessor: (customer) => (
+              <div className="flex gap-2 justify-end">
+                <Button variant="ghost" size="sm" onClick={() => handleBumpVersion(customer)}>
+                  <ArrowUpCircle className="w-3.5 h-3.5" /> Bump SOP
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleEditCustomer(customer)}
-                >
-                  ✏️ Edit
+                <Button variant="ghost" size="sm" onClick={() => handleEditCustomer(customer)}>
+                  <Pencil className="w-3.5 h-3.5" /> Edit
                 </Button>
                 <Button
                   variant="danger"
@@ -225,13 +193,13 @@ export default function CustomersPage() {
                   onClick={() => handleDeleteCustomer(customer)}
                   disabled={deleteMutation.isPending}
                 >
-                  🗑 Delete
+                  <Trash2 className="w-3.5 h-3.5" /> Delete
                 </Button>
               </div>
-            </Card>
-          ))}
-        </div>
-      )}
+            ),
+          },
+        ]}
+      />
 
       {/* Add/Edit Modal */}
       {showModal && (
@@ -282,7 +250,7 @@ function CustomerModal({ customer, onClose, onSuccess }: CustomerModalProps) {
       const newErrors: Record<string, string> = {};
 
       if (!name.trim()) {
-        alert('Customer name is required');
+        showAlert('Customer name is required', { tone: 'error' });
         throw new Error('Validation failed');
       }
       if (!orgId.trim()) newErrors.orgId = 'Org ID is required';
@@ -321,16 +289,17 @@ function CustomerModal({ customer, onClose, onSuccess }: CustomerModalProps) {
       }
     },
     onSuccess: () => {
-      alert(
+      showAlert(
         customer
           ? 'Customer updated'
-          : `Customer "${name}" added`
+          : `Customer "${name}" added`,
+        { tone: 'success' }
       );
       onSuccess();
     },
     onError: (error: any) => {
       if (error.message !== 'Validation failed') {
-        alert('Failed to save: ' + error.message);
+        showAlert('Failed to save: ' + error.message, { tone: 'error' });
       }
     },
   });
@@ -437,7 +406,7 @@ function CustomerModal({ customer, onClose, onSuccess }: CustomerModalProps) {
             onClick={() => saveMutation.mutate()}
             disabled={saveMutation.isPending}
           >
-            💾 {customer ? 'Save Changes' : 'Add Customer'}
+            <Save className="w-4 h-4" /> {customer ? 'Save Changes' : 'Add Customer'}
           </Button>
         </div>
       </div>
@@ -480,13 +449,14 @@ function BumpVersionModal({ customer, onClose, onSuccess }: BumpVersionModalProp
     },
     onSuccess: () => {
       const newVersion = customer.current_version + 1;
-      alert(
-        `${customer.name} bumped to v${newVersion}. All previous certs are now outdated.`
+      showAlert(
+        `${customer.name} bumped to v${newVersion}. All previous certs are now outdated.`,
+        { tone: 'success' }
       );
       onSuccess();
     },
     onError: (error: any) => {
-      alert('Bump failed: ' + error.message);
+      showAlert('Bump failed: ' + error.message, { tone: 'error' });
     },
   });
 
@@ -494,10 +464,13 @@ function BumpVersionModal({ customer, onClose, onSuccess }: BumpVersionModalProp
     <Modal isOpen={true} onClose={onClose} title="Bump SOP Version" size="sm">
       <div className="space-y-4">
         {/* Warning */}
-        <div className="bg-warning/10 border border-warning/30 rounded-lg p-3 text-xs text-warning">
-          ⚠️ Bumping the SOP version will{' '}
-          <strong>invalidate all existing certifications</strong> for this customer.
-          Proctors will need to be re-certified before they can be allocated.
+        <div className="bg-warning/10 border border-warning/30 rounded-lg p-3 text-xs text-warning flex items-start gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+          <span>
+            Bumping the SOP version will{' '}
+            <strong>invalidate all existing certifications</strong> for this customer.
+            Proctors will need to be re-certified before they can be allocated.
+          </span>
         </div>
 
         {/* Version Info */}
@@ -525,7 +498,7 @@ function BumpVersionModal({ customer, onClose, onSuccess }: BumpVersionModalProp
             onClick={() => bumpMutation.mutate()}
             disabled={bumpMutation.isPending || affectedCertsCount === undefined}
           >
-            ⬆ Bump to v{customer.current_version + 1}
+            <ArrowUpCircle className="w-4 h-4" /> Bump to v{customer.current_version + 1}
           </Button>
         </div>
       </div>

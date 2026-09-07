@@ -1,4 +1,6 @@
-import { ReactNode, useEffect } from 'react';
+import { ReactNode, useEffect, useId, useRef } from 'react';
+import { X } from 'lucide-react';
+import { useFocusTrap } from '@/hooks/useFocusTrap';
 
 interface ModalProps {
   isOpen: boolean;
@@ -17,6 +19,10 @@ const sizeClasses = {
 let openModalCount = 0;
 
 export default function Modal({ isOpen, onClose, title, children, size = 'md' }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+  useFocusTrap(dialogRef, isOpen);
+
   useEffect(() => {
     if (isOpen) {
       if (openModalCount === 0) {
@@ -49,26 +55,28 @@ export default function Modal({ isOpen, onClose, title, children, size = 'md' }:
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
-        aria-label={title}
+        aria-labelledby={titleId}
+        tabIndex={-1}
         className={`
           bg-surface border border-border rounded-2xl
           w-full ${sizeClasses[size]} max-h-[90vh]
-          overflow-y-auto shadow-2xl
+          overflow-y-auto shadow-2xl outline-none
         `}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-5 border-b border-border">
-          <h3 className="text-base font-bold text-text">{title}</h3>
+          <h3 id={titleId} className="text-base font-bold text-text">{title}</h3>
           <button
             type="button"
             aria-label="Close dialog"
             onClick={onClose}
-            className="text-text3 hover:text-text transition-colors text-xl leading-none"
+            className="text-text3 hover:text-text hover:bg-surface2 rounded-md p-1.5 transition-colors"
           >
-            ×
+            <X className="w-4 h-4" />
           </button>
         </div>
 

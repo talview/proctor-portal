@@ -65,8 +65,6 @@ export interface Proctor {
   // Evaluation fields
   demo_eval?: string;
   assessment?: string;
-  demo_eval_link?: string;
-  assessment_link?: string;
   demo_ready?: string;
   assessment_ready?: string;
   demo_ready_attempt?: number;
@@ -76,6 +74,7 @@ export interface Proctor {
   nda_status?: string;
   nda_triggered_at?: string | null;
   nda_triggered_by?: string;
+  nda_link_expires_at?: string | null;
   nda_signed_at?: string | null;
   nda_file_url?: string;
   
@@ -85,6 +84,7 @@ export interface Proctor {
   form_link_token?: string;
   form_shared_at?: string | null;
   form_submitted_at?: string | null;
+  form_link_expires_at?: string | null;
   managed_by: Vendor;
   vendor_verified?: boolean;
   vendor_verified_by?: string;
@@ -127,6 +127,13 @@ export interface Evaluation {
   certified_date?: string;
   group_id?: string;
   status?: string;
+  score_obtained?: number;
+  overridden_by?: string;
+  overridden_at?: string;
+  session_code?: string;
+  candidate_id?: string;
+  section_id?: string;
+  result_url?: string;
   created_at: string;
   created_by?: string;
   updated_at?: string;
@@ -175,6 +182,27 @@ export interface ProctorFilters {
   vendor?: Vendor | '';
   status?: ProctorStatus | '';
   ptype?: ProctorType | '';
+  /** Derived from final_form_status + nda_link_expires_at, not a stored column value
+   * on its own -- see the Documents column's badge logic in ProctorsPage.tsx. */
+  docsStatus?: 'not_started' | 'pending' | 'expired' | 'submitted' | '';
+}
+
+// Interview Selects list filters -- 'status' mirrors the Form Status column's
+// derived states (see InterviewSelectsPage's getStatusBadge): 'expired' isn't a
+// stored value on its own, it's a 'shared' row whose form_link_expires_at has
+// passed.
+export interface InterviewSelectFilters {
+  search?: string;
+  vendor?: Vendor | '';
+  status?: 'not_sent' | 'shared' | 'expired' | 'submitted' | '';
+}
+
+/** Tab 0 (flat "Offboarded" list) of OffboardedPage only -- the "Re-onboard History"
+ * tab groups Archived records by aadhaar across the whole archived population and
+ * isn't a filtered/paginated list, so it has no filters type of its own. */
+export interface OffboardedFilters {
+  search?: string;
+  vendor?: Vendor | '';
 }
 
 export interface EvaluationFilters {
@@ -183,4 +211,17 @@ export interface EvaluationFilters {
   ptype?: ProctorType | '';
   result?: EvaluationStatus | '';
   date?: string;
+}
+
+/** Filters for WorkspacePage's "Scheduled Events" tab. `date`/`type` are plain
+ * columns on proctor_evaluations and are applied server-side; `vendor`/`ptype`
+ * filter on the joined proctor (proctor_evaluations has no FK relationship
+ * registered with `proctors` in PostgREST's schema cache, so an embedded-resource
+ * filter isn't available) and are applied client-side to the current page only --
+ * see the ScheduledEventsTab comment above its query for the accuracy tradeoff. */
+export interface ScheduledEventFilters {
+  date?: string;
+  type?: Evaluation['eval_type'] | '';
+  vendor?: Vendor | '';
+  ptype?: ProctorType | '';
 }

@@ -1,15 +1,14 @@
 // Generate and send OTP for form access
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { generateOtp, hashOtp, logAuditEntry, sendMailgunEmail } from '../_shared/nda.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-function generateOTP(): string {
-  return Math.floor(100000 + Math.random() * 900000).toString()
-}
+const MAX_RESENDS = 8
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -52,8 +51,17 @@ serve(async (req) => {
       throw new Error('Form has already been submitted')
     }
 
-    // Generate new OTP
-    const otp = generateOTP()
+    // Caps how many fresh codes can ever be requested for this link -- without this,
+    // resetting the per-code attempt counter on every resend (below) gave an
+    // unlimited total guess budget, just five guesses at a time.
+    if ((proctor.form_otp_send_count || 0) >= MAX_RESENDS) {
+      throw new Error('Too many code requests for this link. Contact your coordinator.')
+    }
+
+    // Generate new OTP -- crypto.getRandomValues-based (not Math.random()), stored
+    // hashed (not plaintext), matching the NDA signing OTP's already-reviewed design.
+    const otp = generateOtp()
+    const otpHash = await hashOtp(otp)
     const otpExpiresAt = new Date()
     otpExpiresAt.setMinutes(otpExpiresAt.getMinutes() + 10) // 10 minutes validity
 
@@ -61,9 +69,10 @@ serve(async (req) => {
     const { error: updateError } = await supabaseClient
       .from('proctors')
       .update({
-        form_otp: otp,
+        form_otp_hash: otpHash,
         form_otp_expires_at: otpExpiresAt.toISOString(),
-        form_otp_attempts: 0, // Reset attempts
+        form_otp_attempts: 0, // per-code attempts -- fine to reset, the code itself just changed
+        form_otp_send_count: (proctor.form_otp_send_count || 0) + 1, // lifetime -- never reset
         form_access_count: (proctor.form_access_count || 0) + 1,
         upd: new Date().toISOString(),
       })
@@ -72,6 +81,8 @@ serve(async (req) => {
     if (updateError) {
       throw updateError
     }
+
+    await logAuditEntry(supabaseClient, proctor.email, 'Onboarding OTP Sent', proctor.name || proctor.id, `Code sent to ${proctor.email}`)
 
     // Mask email for display
     const emailParts = proctor.email.split('@')
@@ -124,52 +135,20 @@ serve(async (req) => {
 </html>
     `
 
-    // Send via Mailgun API
-    const mailgunDomain = Deno.env.get('MAILGUN_DOMAIN')
-    const mailgunApiKey = Deno.env.get('MAILGUN_API_KEY')
-    
-    if (!mailgunDomain || !mailgunApiKey) {
-      throw new Error('Mailgun not configured')
-    }
-
-    const formData = new FormData()
-    formData.append('from', `Talview Proctor Portal <noreply@${mailgunDomain}>`)
-    formData.append('to', proctor.email)
-    formData.append('subject', 'Talview verification code')
-    formData.append('html', emailHtml)
-    formData.append('text', `Hello ${recipientName},
+    // Send via the shared Mailgun helper -- this used to hand-roll its own fetch call
+    // to Mailgun here (duplicating _shared/nda.ts's sendMailgunEmail) and swallowed
+    // Mailgun's real rejection reason into a fixed "Failed to send OTP email" string, so
+    // a real cause (a send-limit, an invalid recipient) never reached the candidate/admin.
+    const emailText = `Hello ${recipientName},
 
 Your one-time verification code is: ${otp}
 
 This code expires in 10 minutes. Do not share it with anyone.
 If you did not request this code, you can ignore this message.
 
-Sent automatically by Talview Proctor Portal.`)
+Sent automatically by Talview Proctor Portal.`
 
-    formData.append('o:tracking-opens', 'no')
-    formData.append('o:tracking-clicks', 'no')
-
-    const replyTo = Deno.env.get('MAILGUN_REPLY_TO')
-    if (replyTo) {
-      formData.append('h:Reply-To', replyTo)
-    }
-
-    const mailgunResponse = await fetch(
-      `https://api.mailgun.net/v3/${mailgunDomain}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Basic ${btoa(`api:${mailgunApiKey}`)}`,
-        },
-        body: formData,
-      }
-    )
-
-    if (!mailgunResponse.ok) {
-      const errorText = await mailgunResponse.text()
-      console.error('Mailgun error:', errorText)
-      throw new Error('Failed to send OTP email')
-    }
+    await sendMailgunEmail(proctor.email, 'Talview verification code', emailHtml, emailText)
 
     return new Response(
       JSON.stringify({
