@@ -1,36 +1,19 @@
 import { supabase } from './supabase';
-import type { User } from '@/types';
 
 export interface AuditEntry {
   action: string;
   target: string;
   detail: string;
+  /** @deprecated the acting user is now derived server-side from the session, not the client */
   user?: string | null;
 }
 
-function getStoredUserName(): string {
-  try {
-    const raw = localStorage.getItem('user');
-    if (!raw) return 'system';
-
-    const parsed = JSON.parse(raw) as Partial<User>;
-    return parsed.username || parsed.name || 'system';
-  } catch {
-    return 'system';
-  }
-}
-
 export async function logAudit(entry: AuditEntry): Promise<void> {
-  const usr = entry.user || getStoredUserName();
-
   try {
-    const { error } = await supabase.from('audit_log').insert({
-      id: crypto.randomUUID(),
-      ts: new Date().toISOString(),
-      usr,
-      action: entry.action,
-      target: entry.target,
-      detail: entry.detail,
+    const { error } = await supabase.rpc('log_audit', {
+      p_action: entry.action,
+      p_target: entry.target,
+      p_detail: entry.detail,
     });
 
     if (error) {

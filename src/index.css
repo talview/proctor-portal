@@ -1,4 +1,15 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+/* Self-hosted (via @fontsource) rather than loaded from Google's CDN at
+   runtime -- no external font request, works on networks that block it. */
+@import '@fontsource/dm-sans/300.css';
+@import '@fontsource/dm-sans/400.css';
+@import '@fontsource/dm-sans/500.css';
+@import '@fontsource/dm-sans/600.css';
+@import '@fontsource/dm-sans/700.css';
+@import '@fontsource/dm-mono/400.css';
+@import '@fontsource/dm-mono/500.css';
+@import '@fontsource/dancing-script/600.css';
+@import '@fontsource/caveat/600.css';
+@import '@fontsource/great-vibes/400.css';
 
 @tailwind base;
 @tailwind components;

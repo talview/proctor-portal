@@ -1,12 +1,15 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { X, Save } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
 import Input from '@/components/ui/Input';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
 import Table from '@/components/ui/Table';
+import FormSection from '@/components/ui/FormSection';
 import { logAudit } from '@/services/audit';
+import { showConfirm, showAlert } from '@/components/ui/GlobalDialog';
 
 interface Vendor {
   id: string;
@@ -39,7 +42,6 @@ interface POC {
 }
 
 export default function VendorsPage() {
-  const { user } = useAuthStore();
   const queryClient = useQueryClient();
   const [showModal, setShowModal] = useState(false);
   const [editingVendor, setEditingVendor] = useState<Vendor | null>(null);
@@ -101,51 +103,30 @@ export default function VendorsPage() {
     },
   });
 
-  const handleDeleteContact = (contactId: string) => {
-    if (!confirm('Remove this contact?')) return;
+  const handleDeleteContact = async (contactId: string) => {
+    const ok = await showConfirm('Remove this contact?', { danger: true });
+    if (!ok) return;
     deleteContactMutation.mutate(contactId);
   };
 
-  if (user?.role !== 'admin') {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <div className="text-4xl mb-2">🔒</div>
-          <h3 className="text-lg font-semibold text-text mb-1">Admin Access Only</h3>
-          <p className="text-text3 text-sm">This page is only accessible to administrators.</p>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div>
       {/* Header */}
       <div className="flex justify-end mb-4">
         <Button variant="primary" size="sm" onClick={handleAddVendor}>
-          + Add Managed By
+          + Add Vendor
         </Button>
       </div>
 
       {/* Vendor List */}
-      {isLoading ? (
-        <div className="flex items-center justify-center h-64">
-          <div className="text-center">
-            <div className="text-4xl mb-2">⏳</div>
-            <h3 className="text-lg font-semibold text-text">Loading...</h3>
-          </div>
-        </div>
-      ) : vendors.length === 0 ? (
-        <div className="bg-warning/10 border border-warning/30 rounded-lg p-4 text-sm text-warning">
-          No managed by entries found. Click + Add Managed By to get started.
-        </div>
-      ) : (
-        <Table
+      <Table
           data={vendors}
-          emptyMessage="No managed by entries found. Click + Add Managed By to get started."
+          isLoading={isLoading}
+          emptyMessage="No vendors found. Click + Add Vendor to get started."
           columns={[
             {
-              header: 'Managed By',
+              header: 'Vendor',
               accessor: (vendor) => (
                 <div className="flex flex-col gap-1">
                   <div className="font-semibold text-text">{vendor.name}</div>
@@ -227,7 +208,6 @@ export default function VendorsPage() {
             },
           ]}
         />
-      )}
 
       {/* Add/Edit Modal */}
       {showModal && (
@@ -262,7 +242,7 @@ function POCRow({ poc, index, onUpdate, onDelete, onSetPrimary }: POCRowProps) {
 
   return (
     <div
-      className="grid grid-cols-[1fr_1fr_1fr_1fr_auto] gap-2 items-end p-3 bg-surface2 rounded-md"
+      className="grid grid-cols-2 sm:grid-cols-[1fr_1fr_1fr_1fr_auto] gap-2 items-end p-3 bg-surface2 rounded-md"
     >
       {/* Name */}
       <div>
@@ -297,7 +277,7 @@ function POCRow({ poc, index, onUpdate, onDelete, onSetPrimary }: POCRowProps) {
           placeholder="poc@company.com"
           size="sm"
         />
-        {emailError && <div className="text-[10px] text-danger mt-0.5">{emailError}</div>}
+        {emailError && <div className="text-xs text-danger mt-1">{emailError}</div>}
       </div>
       {/* Phone */}
       <div>
@@ -315,7 +295,7 @@ function POCRow({ poc, index, onUpdate, onDelete, onSetPrimary }: POCRowProps) {
           placeholder="10-digit number"
           size="sm"
         />
-        {phoneError && <div className="text-[10px] text-danger mt-0.5">{phoneError}</div>}
+        {phoneError && <div className="text-xs text-danger mt-1">{phoneError}</div>}
       </div>
       {/* Primary & Delete */}
       <div className="flex flex-col gap-1 items-center">
@@ -329,9 +309,9 @@ function POCRow({ poc, index, onUpdate, onDelete, onSetPrimary }: POCRowProps) {
         <button
           type="button"
           onClick={() => onDelete(index)}
-          className="text-[10px] text-danger hover:underline px-1.5 py-0.5"
+          className="text-danger hover:text-danger/80 px-1.5 py-0.5"
         >
-          ✕
+          <X className="w-3.5 h-3.5" />
         </button>
       </div>
     </div>
@@ -355,8 +335,6 @@ function VendorModal({
   const [name, setName] = useState(vendor?.name || '');
   const [code, setCode] = useState(vendor?.code || '');
   const [active, setActive] = useState(vendor?.active ?? true);
-  const [modalError, setModalError] = useState('');
-  const [modalSuccess, setModalSuccess] = useState('');
   const [pocs, setPocs] = useState<POC[]>(
     existingContacts.map((c) => ({
       id: c.id,
@@ -374,11 +352,11 @@ function VendorModal({
     mutationFn: async () => {
       // Validate basic fields
       if (!name.trim()) {
-        setModalError('Name is required');
+        showAlert('Name is required', { tone: 'error' });
         throw new Error('Validation failed');
       }
       if (!code.trim()) {
-        setModalError('Code is required (used for Proctor IDs)');
+        showAlert('Code is required (used for Proctor IDs)', { tone: 'error' });
         throw new Error('Validation failed');
       }
 
@@ -386,15 +364,15 @@ function VendorModal({
       const activePOCs = pocs.filter((p) => !p._del);
       for (const poc of activePOCs) {
         if (!poc.name.trim()) {
-          setModalError('All POC entries must have a name');
+          showAlert('All POC entries must have a name', { tone: 'error' });
           throw new Error('Validation failed');
         }
         if (poc.email && !poc.email.includes('@')) {
-          setModalError(`POC email "${poc.email}" is not valid — must include @`);
+          showAlert(`POC email "${poc.email}" is not valid — must include @`, { tone: 'error' });
           throw new Error('Validation failed');
         }
         if (poc.phone && !/^\d{10}$/.test(poc.phone)) {
-          setModalError(`POC phone "${poc.phone}" must be exactly 10 digits`);
+          showAlert(`POC phone "${poc.phone}" must be exactly 10 digits`, { tone: 'error' });
           throw new Error('Validation failed');
         }
       }
@@ -418,16 +396,16 @@ function VendorModal({
 
         if (previousActive !== active) {
           void logAudit({
-            action: 'Managed By Status Changed',
+            action: 'Vendor Status Changed',
             target: name.trim(),
             detail: `Status changed from ${previousActive ? 'Active' : 'Inactive'} to ${active ? 'Active' : 'Inactive'}`,
             user: user?.username || user?.email || 'unknown',
           });
         } else {
           void logAudit({
-            action: 'Managed By Updated',
+            action: 'Vendor Updated',
             target: name.trim(),
-            detail: `Updated managed by entry${active ? ' · Active' : ' · Inactive'}`,
+            detail: `Updated vendor entry${active ? ' · Active' : ' · Inactive'}`,
             user: user?.username || user?.email || 'unknown',
           });
         }
@@ -445,9 +423,9 @@ function VendorModal({
         if (error) throw error;
 
         void logAudit({
-          action: 'Managed By Created',
+          action: 'Vendor Created',
           target: name.trim(),
-          detail: `Created managed by entry ${code.trim().toUpperCase()} · ${active ? 'Active' : 'Inactive'}`,
+          detail: `Created vendor ${code.trim().toUpperCase()} · ${active ? 'Active' : 'Inactive'}`,
           user: user?.username || user?.email || 'unknown',
         });
       }
@@ -487,12 +465,12 @@ function VendorModal({
       }
     },
     onSuccess: () => {
-      setModalSuccess(vendor ? 'Updated successfully' : 'Added successfully');
+      showAlert(vendor ? 'Updated successfully' : 'Added successfully', { tone: 'success' });
       onSuccess();
     },
     onError: (error: any) => {
       if (error.message !== 'Validation failed') {
-        setModalError('Failed to save: ' + error.message);
+        showAlert('Failed to save: ' + error.message, { tone: 'error' });
       }
     },
   });
@@ -548,27 +526,13 @@ function VendorModal({
     <Modal
       isOpen={true}
       onClose={onClose}
-      title={vendor ? 'Edit Managed By' : 'Add Managed By'}
+      title={vendor ? 'Edit Vendor' : 'Add Vendor'}
       size="lg"
     >
       <div className="space-y-6">
-        {/* Error/Success Banners */}
-        {modalError && (
-          <div className="bg-danger/10 border border-danger/30 text-danger rounded-lg p-3 text-xs font-semibold">
-            ⚠️ {modalError}
-          </div>
-        )}
-        {modalSuccess && (
-          <div className="bg-success/10 border border-success/30 text-success rounded-lg p-3 text-xs font-semibold">
-            ✅ {modalSuccess}
-          </div>
-        )}
 
         {/* Basic Info */}
-        <div>
-          <div className="text-xs font-bold text-text3 uppercase tracking-wider mb-3">
-            Basic Info
-          </div>
+        <FormSection title="Basic Info">
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold text-text mb-1">
@@ -607,18 +571,17 @@ function VendorModal({
               Active
             </label>
           </div>
-        </div>
+        </FormSection>
 
         {/* Points of Contact */}
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <div className="text-xs font-bold text-text3 uppercase tracking-wider">
-              Points of Contact
-            </div>
+        <FormSection
+          title="Points of Contact"
+          action={
             <Button variant="ghost" size="sm" onClick={addPOC}>
               + Add POC
             </Button>
-          </div>
+          }
+        >
 
           {activePOCs.length === 0 ? (
             <div className="text-xs text-text3 py-2">
@@ -638,7 +601,7 @@ function VendorModal({
               ))}
             </div>
           )}
-        </div>
+        </FormSection>
 
         {/* Actions */}
         <div className="flex gap-2 justify-end pt-4 border-t border-border">
@@ -650,7 +613,7 @@ function VendorModal({
             onClick={() => saveMutation.mutate()}
             disabled={saveMutation.isPending}
           >
-            💾 Save
+            <Save className="w-4 h-4" /> Save
           </Button>
         </div>
       </div>

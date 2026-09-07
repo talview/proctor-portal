@@ -5,13 +5,16 @@ interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
   error?: string;
   options: { value: string; label: string }[];
   id?: string;
+  /** Class for the outer wrapper div. Defaults to full-width for form usage;
+   * pass e.g. "w-auto" or "min-w-[160px]" in filter bars to avoid stretching. */
+  wrapperClassName?: string;
 }
 
 const Select = forwardRef<HTMLSelectElement, SelectProps>(
-  ({ label, error, options, className = '', id, ...props }, ref) => {
+  ({ label, error, options, className = '', wrapperClassName = 'w-full', id, ...props }, ref) => {
     const selectId = id || (label ? `select-${label.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')}` : undefined);
     return (
-      <div className="w-full">
+      <div className={wrapperClassName}>
         {label && (
           <label htmlFor={selectId} className="block text-xs font-semibold text-text2 uppercase tracking-wide mb-1.5">
             {label}

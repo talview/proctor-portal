@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { useSearchParams } from 'react-router';
+import { useSearchParams } from 'react-router-dom';
+import { XCircle, GraduationCap, Mail, Loader2, CheckCircle2, RefreshCw, PartyPopper } from 'lucide-react';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import Button from '@/components/ui/Button';
-import { supabase } from '@/services/supabase';
 
 const STATES = [
   'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh',
@@ -30,6 +30,7 @@ export default function OnboardingFormPage() {
 
   // Onboarding form
   const [proctorData, setProctorData] = useState<any>(null);
+  const [formSubmitToken, setFormSubmitToken] = useState('');
   const [formData, setFormData] = useState({
     name: '',
     aadhaar: '',
@@ -112,6 +113,7 @@ export default function OnboardingFormPage() {
 
       // OTP verified - show form
       setProctorData(data.proctor);
+      setFormSubmitToken(data.formSubmitToken || '');
       setFormData({
         name: data.proctor.name || '',
         aadhaar: data.proctor.aadhaar || '',
@@ -166,26 +168,33 @@ export default function OnboardingFormPage() {
       setLoading(true);
       setError('');
 
-      // Update proctor record
-      const { error: updateError } = await supabase
-        .from('proctors')
-        .update({
-          name: formData.name.trim(),
-          aadhaar: formData.aadhaar.trim(),
-          phone: formData.phone.trim(),
-          address: formData.address.trim(),
-          city: formData.city.trim(),
-          state: formData.state,
-          dob: formData.dob,
-          gender: formData.gender,
-          form_status: 'submitted',
-          status: 'In Progress',
-          stage: 1,
-          upd: new Date().toISOString(),
-        })
-        .eq('id', proctorData.id);
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const response = await fetch(`${supabaseUrl}/functions/v1/submit-onboarding-form`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({
+          proctorId: proctorData.id,
+          token: formSubmitToken,
+          formData: {
+            name: formData.name.trim(),
+            aadhaar: formData.aadhaar.trim(),
+            phone: formData.phone.trim(),
+            address: formData.address.trim(),
+            city: formData.city.trim(),
+            state: formData.state,
+            dob: formData.dob,
+            gender: formData.gender,
+          },
+        }),
+      });
 
-      if (updateError) throw updateError;
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to submit form');
+      }
 
       setStep('success');
     } catch (err: any) {
@@ -199,7 +208,7 @@ export default function OnboardingFormPage() {
     return (
       <div className="min-h-screen bg-bg flex items-center justify-center p-6">
         <div className="bg-surface border border-border rounded-2xl p-8 max-w-md w-full text-center">
-          <div className="text-6xl mb-4">❌</div>
+          <XCircle className="w-14 h-14 text-danger mx-auto mb-4" />
           <h1 className="text-xl font-bold text-text mb-2">Invalid Link</h1>
           <p className="text-text2 text-sm">
             This onboarding link is invalid or has expired.
@@ -213,8 +222,8 @@ export default function OnboardingFormPage() {
     <div className="min-h-screen bg-bg flex items-center justify-center p-6">
       <div className="bg-surface border border-border rounded-2xl max-w-2xl w-full overflow-hidden">
         {/* Header */}
-        <div className="bg-gradient-to-r from-accent to-accent5 p-8 text-center">
-          <div className="text-4xl mb-3">🎓</div>
+        <div className="bg-gradient-to-r from-accent to-accent5 p-5 sm:p-8 text-center">
+          <GraduationCap className="w-10 h-10 text-white mx-auto mb-3" />
           <h1 className="text-2xl font-bold text-white mb-2">
             Talview Proctor Onboarding
           </h1>
@@ -225,7 +234,7 @@ export default function OnboardingFormPage() {
           </p>
         </div>
 
-        <div className="p-8">
+        <div className="p-5 sm:p-8">
           {error && (
             <div className="bg-danger/10 border border-danger/30 rounded-lg p-4 mb-6 text-danger text-sm">
               {error}
@@ -238,7 +247,7 @@ export default function OnboardingFormPage() {
               {otpSent ? (
                 <>
                   <div className="text-center mb-6">
-                    <div className="text-5xl mb-4">📧</div>
+                    <Mail className="w-12 h-12 text-accent mx-auto mb-4" />
                     <h2 className="text-lg font-semibold text-text mb-2">
                       OTP Sent!
                     </h2>
@@ -278,7 +287,7 @@ export default function OnboardingFormPage() {
                       className="flex-1"
                       disabled={loading || otp.length !== 6}
                     >
-                      {loading ? 'Verifying...' : '✅ Verify OTP'}
+                      {loading ? 'Verifying...' : <><CheckCircle2 className="w-4 h-4" /> Verify OTP</>}
                     </Button>
                     <Button
                       type="button"
@@ -286,13 +295,13 @@ export default function OnboardingFormPage() {
                       onClick={handleSendOTP}
                       disabled={loading}
                     >
-                      🔄 Resend
+                      <RefreshCw className="w-4 h-4" /> Resend
                     </Button>
                   </div>
                 </>
               ) : (
                 <div className="text-center py-8">
-                  <div className="text-5xl mb-4">⏳</div>
+                  <Loader2 className="w-12 h-12 text-accent mx-auto mb-4 animate-spin" />
                   <p className="text-text2">Sending OTP to your email...</p>
                 </div>
               )}
@@ -311,7 +320,6 @@ export default function OnboardingFormPage() {
                   <Input
                     value={formData.name}
                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                    placeholder="John Doe"
                   />
                   {formErrors.name && (
                     <div className="text-danger text-xs mt-1">{formErrors.name}</div>
@@ -319,7 +327,7 @@ export default function OnboardingFormPage() {
                 </div>
 
                 {/* Aadhaar & Phone */}
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-semibold text-text mb-1">
                       Aadhaar Number <span className="text-danger">*</span>
@@ -331,7 +339,6 @@ export default function OnboardingFormPage() {
                         const value = e.target.value.replace(/\D/g, '').slice(0, 12);
                         setFormData({ ...formData, aadhaar: value });
                       }}
-                      placeholder="123456789012"
                       maxLength={12}
                     />
                     {formErrors.aadhaar && (
@@ -350,7 +357,6 @@ export default function OnboardingFormPage() {
                         const value = e.target.value.replace(/\D/g, '').slice(0, 10);
                         setFormData({ ...formData, phone: value });
                       }}
-                      placeholder="9876543210"
                       maxLength={10}
                     />
                     {formErrors.phone && (
@@ -367,7 +373,6 @@ export default function OnboardingFormPage() {
                   <textarea
                     value={formData.address}
                     onChange={(e) => setFormData({ ...formData, address: e.target.value })}
-                    placeholder="House No., Street, Locality"
                     rows={2}
                     className="w-full px-3 py-2 bg-surface2 border border-border rounded-lg text-sm text-text outline-none focus:border-accent resize-none"
                   />
@@ -377,7 +382,7 @@ export default function OnboardingFormPage() {
                 </div>
 
                 {/* City & State */}
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-semibold text-text mb-1">
                       City <span className="text-danger">*</span>
@@ -385,7 +390,6 @@ export default function OnboardingFormPage() {
                     <Input
                       value={formData.city}
                       onChange={(e) => setFormData({ ...formData, city: e.target.value })}
-                      placeholder="Bangalore"
                     />
                     {formErrors.city && (
                       <div className="text-danger text-xs mt-1">{formErrors.city}</div>
@@ -411,7 +415,7 @@ export default function OnboardingFormPage() {
                 </div>
 
                 {/* DOB & Gender */}
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-semibold text-text mb-1">
                       Date of Birth <span className="text-danger">*</span>
@@ -447,14 +451,14 @@ export default function OnboardingFormPage() {
                   </div>
                 </div>
 
-                {/* Managed By & Type (Read-only) */}
+                {/* Vendor & Type (Read-only) */}
                 <div className="bg-surface2 border border-border rounded-lg p-4">
                   <div className="text-xs font-semibold text-text3 uppercase mb-2">
                     Assignment Details
                   </div>
-                  <div className="grid grid-cols-2 gap-4 text-sm">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
                     <div>
-                      <span className="text-text3">Managed By:</span>{' '}
+                      <span className="text-text3">Vendor:</span>{' '}
                       <span className="text-text font-semibold">{proctorData.managed_by}</span>
                     </div>
                     <div>
@@ -472,7 +476,7 @@ export default function OnboardingFormPage() {
                   className="w-full"
                   disabled={loading}
                 >
-                  {loading ? 'Submitting...' : '✅ Submit Onboarding Form'}
+                  {loading ? 'Submitting...' : <><CheckCircle2 className="w-4 h-4" /> Submit Onboarding Form</>}
                 </Button>
               </div>
             </form>
@@ -481,7 +485,7 @@ export default function OnboardingFormPage() {
           {/* Success Step */}
           {step === 'success' && (
             <div className="text-center py-8">
-              <div className="text-6xl mb-6">🎉</div>
+              <PartyPopper className="w-16 h-16 text-accent mx-auto mb-6" />
               <h2 className="text-2xl font-bold text-text mb-3">
                 Registration Complete!
               </h2>
@@ -489,8 +493,8 @@ export default function OnboardingFormPage() {
                 Thank you for completing your onboarding form. Our team will review your
                 information and contact you soon.
               </p>
-              <div className="bg-success/10 border border-success/30 rounded-lg p-4 text-sm text-success">
-                ✅ Your profile has been successfully submitted
+              <div className="bg-success/10 border border-success/30 rounded-lg p-4 text-sm text-success flex items-center justify-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> Your profile has been successfully submitted
               </div>
             </div>
           )}

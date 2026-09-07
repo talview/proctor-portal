@@ -5,6 +5,9 @@ interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'size'>
   error?: string;
   size?: 'sm' | 'md';
   id?: string;
+  /** Class for the outer wrapper div. Defaults to full-width for form usage;
+   * pass e.g. "w-auto" or "flex-1 min-w-[200px]" in filter bars to avoid stretching. */
+  wrapperClassName?: string;
 }
 
 const sizeClasses = {
@@ -13,10 +16,10 @@ const sizeClasses = {
 };
 
 const Input = forwardRef<HTMLInputElement, InputProps>(
-  ({ label, error, size = 'md', className = '', id, ...props }, ref) => {
+  ({ label, error, size = 'md', className = '', wrapperClassName = 'w-full', id, ...props }, ref) => {
     const inputId = id || (label ? `input-${label.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')}` : undefined);
     return (
-      <div className="w-full">
+      <div className={wrapperClassName}>
         {label && (
           <label htmlFor={inputId} className="block text-xs font-semibold text-text2 uppercase tracking-wide mb-1.5">
             {label}

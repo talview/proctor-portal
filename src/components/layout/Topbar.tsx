@@ -1,43 +1,28 @@
-import { useLocation } from 'react-router';
 import { useState, useEffect } from 'react';
-
-const PAGE_TITLES: Record<string, string> = {
-  '/': 'Dashboard',
-  '/proctors': 'All Proctors',
-  '/my-proctors': 'My Proctors',
-  '/interview-selects': 'Interview Selects',
-  '/onboarding': 'In Progress',
-  '/active': 'Active Proctors',
-  '/offboarded': 'Offboarded & History',
-  '/add-proctor': 'Add Proctor',
-  '/evaluations': 'Evaluations',
-  '/workspace': 'My Workspace',
-  '/incomplete': 'Incomplete BGV',
-  '/certifications': 'Certifications',
-  '/customers': 'Customers',
-  '/vendors': 'Managed By',
-  '/audit': 'Audit Log',
-  '/form-links': 'Form Links',
-};
+import PageSwitcher from './PageSwitcher';
 
 export default function Topbar() {
-  const location = useLocation();
-  const title = PAGE_TITLES[location.pathname] || 'Proctor Portal';
-  const [time, setTime] = useState(() => new Date().toLocaleTimeString());
+  const [now, setNow] = useState(() => new Date());
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setTime(new Date().toLocaleTimeString());
-    }, 1000);
+    const timer = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
 
+  const istTime = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const utcTime = now.toLocaleTimeString('en-GB', { timeZone: 'UTC' });
+
   return (
-    <div className="bg-surface border-b border-border px-6 h-14 flex items-center justify-between sticky top-0 z-40 shadow-sm">
-      <h1 className="text-base font-bold text-text">{title}</h1>
-      <div className="flex items-center gap-3">
+    <div className="bg-white border-b border-border px-6 h-14 flex items-center justify-between gap-3 sticky top-0 z-40 shadow-sm">
+      <div className="flex-1 min-w-0 overflow-x-auto">
+        <PageSwitcher />
+      </div>
+      <div className="hidden sm:flex items-center gap-3 flex-shrink-0">
         <span className="text-[11px] text-text3">
-          {time}
+          {istTime} IST
+        </span>
+        <span className="text-[11px] text-text3 border-l border-border pl-3">
+          {utcTime} UTC
         </span>
       </div>
     </div>

@@ -9,6 +9,8 @@ export const proctorService = {
     let query = supabase
       .from('proctors')
       .select('*')
+      .neq('status', 'Archived') // Archived rows are re-onboarding history, surfaced only on the Offboarded & History page
+      .neq('interview_stage', 'interview_selected') // pre-form-submission candidates belong only on the Interview Selects page
       .order('at', { ascending: false }); // Use 'at' not 'created_at'
 
     if (filters?.vendor) {
@@ -39,7 +41,6 @@ export const proctorService = {
           p.name.toLowerCase().includes(search) ||
           p.email?.toLowerCase().includes(search) ||
           p.phone?.includes(search) ||
-          p.aadhaar?.includes(search) ||
           p.pid?.toLowerCase().includes(search)
       );
     }
@@ -182,13 +183,15 @@ export const proctorService = {
     // Count interview selects separately
     const interviewSelects = allProctors.filter(p => p.interview_stage === 'interview_selected').length;
     
-    // BGV statistics
-    const bgvMissing = activeProctors.filter(p => !p.bgv);
+    // BGV statistics -- only collectible once a proctor is Active, and the due window
+    // (12 days, matching IncompletePage) counts from activation (aat), not creation.
+    const BGV_DUE_DAYS = 12;
+    const bgvMissing = activeProctors.filter(p => p.status === 'Active' && !p.bgv);
     const bgvOverdue = bgvMissing.filter(p => {
-      // Calculate if BGV is overdue (simplified - you can add bgvDueInfo logic if needed)
-      const createdDate = new Date(p.at);
-      const daysSinceCreated = Math.floor((Date.now() - createdDate.getTime()) / (1000 * 60 * 60 * 24));
-      return daysSinceCreated > 7; // Example: overdue after 7 days
+      if (!p.aat) return false;
+      const activatedDate = new Date(p.aat);
+      const daysSinceActivated = Math.floor((Date.now() - activatedDate.getTime()) / (1000 * 60 * 60 * 24));
+      return daysSinceActivated > BGV_DUE_DAYS;
     }).length;
     
     // Certification statistics
@@ -214,11 +217,12 @@ export const proctorService = {
     
     allVendors.forEach((v) => {
       const vendorProctors = activeProctors.filter(p => (p.vendor || p.managed_by) === v);
-      const vendorBgvMissing = vendorProctors.filter(p => !p.bgv);
+      const vendorBgvMissing = vendorProctors.filter(p => p.status === 'Active' && !p.bgv);
       const vendorBgvOverdue = vendorBgvMissing.filter(p => {
-        const createdDate = new Date(p.at);
-        const daysSinceCreated = Math.floor((Date.now() - createdDate.getTime()) / (1000 * 60 * 60 * 24));
-        return daysSinceCreated > 7;
+        if (!p.aat) return false;
+        const activatedDate = new Date(p.aat);
+        const daysSinceActivated = Math.floor((Date.now() - activatedDate.getTime()) / (1000 * 60 * 60 * 24));
+        return daysSinceActivated > BGV_DUE_DAYS;
       }).length;
       
       stats.byVendor[v] = {

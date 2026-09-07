@@ -41,6 +41,7 @@ export function formatRelativeTime(date: string | Date | null | undefined): stri
  */
 export function formatPhone(phone: string | null | undefined): string {
   if (!phone) return '—';
+  if (phone.startsWith('PENDING_')) return 'Not provided yet';
   // Format as +91 XXXXX XXXXX
   if (phone.length === 10) {
     return `${phone.slice(0, 5)} ${phone.slice(5)}`;
@@ -49,14 +50,13 @@ export function formatPhone(phone: string | null | undefined): string {
 }
 
 /**
- * Mask Aadhaar number (show only last 4 digits)
+ * Aadhaar is stored only as a one-way hash (see migration 0032) -- there's no
+ * plaintext left to mask or reveal for any role, including admin. This just
+ * reports whether one is on file.
  */
-export function maskAadhaar(aadhaar: string | null | undefined): string {
-  if (!aadhaar) return '—';
-  if (aadhaar.length === 12) {
-    return `XXXX XXXX ${aadhaar.slice(-4)}`;
-  }
-  return aadhaar;
+export function aadhaarStatus(aadhaar: string | null | undefined): string {
+  if (!aadhaar || aadhaar.startsWith('PENDING_')) return 'Not provided yet';
+  return 'On file';
 }
 
 /**

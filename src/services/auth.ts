@@ -1,101 +1,93 @@
 import { supabase } from './supabase';
 import { logAudit } from './audit';
-import type { User } from '@/types';
+import type { User, UserRole } from '@/types';
+
+const ROLE_VALUES: UserRole[] = ['admin', 'vendor', 'coordinator'];
+
+async function buildUserFromSession(authUserId: string, fallbackEmail: string): Promise<User> {
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, username, email, role, created_at, vendors(name)')
+    .eq('id', authUserId)
+    .single();
+
+  if (error || !data) {
+    throw new Error('No profile found for this account. Ask an admin to set one up.');
+  }
+
+  const role = ROLE_VALUES.includes(data.role as UserRole) ? (data.role as UserRole) : 'vendor';
+  const vendorName = (data as unknown as { vendors: { name: string } | null }).vendors?.name;
+  const username = data.username || fallbackEmail.split('@')[0];
+
+  return {
+    id: data.id,
+    username,
+    name: username.replace(/_/g, ' '),
+    email: data.email || fallbackEmail,
+    role,
+    vendor: vendorName as User['vendor'],
+    created_at: data.created_at || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
 
 export const authService = {
   /**
-   * Login with username and password using Supabase RPC (same as original HTML)
+   * Login with email and password using real Supabase Auth.
    */
-  async login(username: string, password: string): Promise<User> {
-    try {
-      // Call the verify_login RPC function (same as original HTML app)
-      const { data, error } = await supabase.rpc('verify_login', {
-        p_username: username,
-        p_password: password,
-      });
+  async login(email: string, password: string): Promise<User> {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
-      if (error) {
-        throw new Error('Invalid credentials');
-      }
-
-      if (!data || data.length === 0) {
-        throw new Error('Invalid credentials');
-      }
-
-      const userData = data[0];
-
-      // Map the role names to match our type system
-      const roleMap: Record<string, 'admin' | 'vendor' | 'coordinator'> = {
-        admin: 'admin',
-        talview: 'coordinator',
-        vendor: 'vendor',
-      };
-
-      const user: User = {
-        id: userData.id || username,
-        username: userData.username,
-        name: userData.username.replace(/_/g, ' '),
-        email: userData.email || '',
-        role: roleMap[userData.role] || 'vendor',
-        vendor: userData.vendor || undefined,
-        created_at: userData.created_at || new Date().toISOString(),
-        updated_at: userData.updated_at || new Date().toISOString(),
-      };
-
-      localStorage.setItem('user', JSON.stringify({ user, storedAt: Date.now() }));
-      void logAudit({
-        action: 'Login',
-        target: user.username,
-        detail: `Signed in as ${user.role}${user.vendor ? ` · ${user.vendor}` : ''}`,
-        user: user.username,
-      });
-      return user;
-    } catch (error) {
-      if (error instanceof Error && error.message !== 'Invalid credentials') {
-        throw error;
-      }
+    if (error || !data.user) {
       throw new Error('Invalid credentials');
     }
+
+    const user = await buildUserFromSession(data.user.id, data.user.email || email);
+
+    localStorage.setItem('user', JSON.stringify(user));
+    void logAudit({
+      action: 'Login',
+      target: user.username,
+      detail: `Signed in as ${user.role}${user.vendor ? ` · ${user.vendor}` : ''}`,
+      user: user.email,
+    });
+
+    return user;
   },
 
   /**
    * Logout current user
    */
-  logout(): void {
-    const current = this.getCurrentUser();
+  async logout(): Promise<void> {
+    const current = await this.getCurrentUser();
     if (current) {
       void logAudit({
         action: 'Logout',
         target: current.username,
-        detail: `Signed out by ${current.username}`,
-        user: current.username,
+        detail: `Signed out by ${current.email}`,
+        user: current.email,
       });
     }
     localStorage.removeItem('user');
+    await supabase.auth.signOut();
   },
 
   /**
-   * Get current logged-in user
+   * Get current logged-in user from the real Supabase Auth session (not localStorage --
+   * that's now just a display cache, the session itself is managed by the SDK).
    */
-  getCurrentUser(): User | null {
-    const userStr = localStorage.getItem('user');
-    if (!userStr) return null;
+  async getCurrentUser(): Promise<User | null> {
+    const { data } = await supabase.auth.getSession();
+    const sessionUser = data.session?.user;
+    if (!sessionUser) {
+      localStorage.removeItem('user');
+      return null;
+    }
 
     try {
-      const parsed = JSON.parse(userStr) as { user?: User; storedAt?: number } | User;
-
-      // Handle new session wrapper format
-      if ('storedAt' in parsed && parsed.storedAt !== undefined) {
-        const SESSION_TTL = 8 * 60 * 60 * 1000; // 8 hours
-        if (Date.now() - parsed.storedAt > SESSION_TTL) {
-          localStorage.removeItem('user');
-          return null;
-        }
-        return (parsed as { user: User; storedAt: number }).user;
-      }
-
-      // Handle legacy format (plain User object)
-      return parsed as User;
+      const user = await buildUserFromSession(sessionUser.id, sessionUser.email || '');
+      localStorage.setItem('user', JSON.stringify(user));
+      return user;
     } catch {
       return null;
     }
@@ -104,7 +96,7 @@ export const authService = {
   /**
    * Check if user is authenticated
    */
-  isAuthenticated(): boolean {
-    return this.getCurrentUser() !== null;
+  async isAuthenticated(): Promise<boolean> {
+    return (await this.getCurrentUser()) !== null;
   },
 };
