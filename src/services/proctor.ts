@@ -1,11 +1,16 @@
 import { supabase } from './supabase';
 import type { Proctor, ProctorFilters } from '@/types';
+import { PROCTOR_SEARCH_COLUMNS } from '@/utils/constants';
+import { orIlikeFilter } from '@/utils/postgrest';
+import { EXPORT_ROW_CAP } from '@/lib/csv';
 
 export const proctorService = {
   /**
-   * Get all proctors with optional filters
+   * Get all proctors matching the given filters, for export -- this is this
+   * service's only caller (ProctorsPage's export button), so the
+   * EXPORT_ROW_CAP applies unconditionally rather than as an opt-in.
    */
-  async getAll(filters?: ProctorFilters): Promise<Proctor[]> {
+  async getAll(filters?: ProctorFilters): Promise<{ rows: Proctor[]; truncated: boolean }> {
     let query = supabase
       .from('proctors')
       .select('*')
@@ -14,7 +19,7 @@ export const proctorService = {
       .order('at', { ascending: false }); // Use 'at' not 'created_at'
 
     if (filters?.vendor) {
-      query = query.eq('managed_by', filters.vendor);
+      query = query.eq('vendor', filters.vendor);
     }
 
     if (filters?.status) {
@@ -25,27 +30,25 @@ export const proctorService = {
       query = query.eq('ptype', filters.ptype);
     }
 
-    const { data, error } = await query;
+    // Server-side search, over PROCTOR_SEARCH_COLUMNS -- the same constant
+    // ProctorsPage's paginated table uses, so the two can't drift apart again the
+    // way they did before (this used to be a separate client-side .filter() that
+    // still matched on phone after that was deliberately dropped from the table's
+    // search, so export could return a different set of rows than what's on screen
+    // for the same search term).
+    const search = filters?.search?.trim();
+    if (search) {
+      query = query.or(orIlikeFilter(PROCTOR_SEARCH_COLUMNS, search));
+    }
+
+    const { data, error } = await query.range(0, EXPORT_ROW_CAP);
 
     if (error) {
       throw new Error(error.message);
     }
 
-    let result = data as Proctor[];
-
-    // Client-side search filter
-    if (filters?.search) {
-      const search = filters.search.toLowerCase();
-      result = result.filter(
-        (p) =>
-          p.name.toLowerCase().includes(search) ||
-          p.email?.toLowerCase().includes(search) ||
-          p.phone?.includes(search) ||
-          p.pid?.toLowerCase().includes(search)
-      );
-    }
-
-    return result;
+    const rows = (data ?? []) as Proctor[];
+    return { rows: rows.slice(0, EXPORT_ROW_CAP), truncated: rows.length > EXPORT_ROW_CAP };
   },
 
   /**
@@ -153,94 +156,49 @@ export const proctorService = {
    * Get dashboard statistics
    */
   async getStats(vendor?: string) {
-    // Fetch all required fields (using correct database column names)
-    let query = supabase.from('proctors').select('status, managed_by, interview_stage, bgv, demo_ready, assessment_ready, at, upd, vendor');
-
-    if (vendor) {
-      query = query.or(`vendor.eq."${vendor}",managed_by.eq."${vendor}"`);
-    }
-
-    const { data, error } = await query;
+    // Computed server-side via get_proctor_stats -- a single Postgres aggregate
+    // query (count(*) filter, group by vendor), not a fetch-every-row-then-count-
+    // in-JS pass. The function itself re-scopes a vendor-role caller to their own
+    // vendor regardless of what's passed here, so this is purely which vendor the
+    // *current* admin/coordinator view wants to look at, not an access boundary.
+    const { data, error } = await supabase.rpc('get_proctor_stats', {
+      p_vendor: vendor ?? null,
+    });
 
     if (error) {
       throw new Error(error.message);
     }
 
-    const allProctors = data as Proctor[];
-    
-    // Map vendor field (fallback to managed_by if vendor doesn't exist)
-    allProctors.forEach(p => {
-      if (!p.vendor && p.managed_by) {
-        p.vendor = p.managed_by;
-      }
-    });
-    
-    // Exclude interview_selected and Archived proctors from main stats (like HTML app)
-    const activeProctors = allProctors.filter(
-      p => p.status !== 'Archived' && p.interview_stage !== 'interview_selected'
-    );
-    
-    // Count interview selects separately
-    const interviewSelects = allProctors.filter(p => p.interview_stage === 'interview_selected').length;
-    
-    // BGV statistics -- only collectible once a proctor is Active, and the due window
-    // (12 days, matching IncompletePage) counts from activation (aat), not creation.
-    const BGV_DUE_DAYS = 12;
-    const bgvMissing = activeProctors.filter(p => p.status === 'Active' && !p.bgv);
-    const bgvOverdue = bgvMissing.filter(p => {
-      if (!p.aat) return false;
-      const activatedDate = new Date(p.aat);
-      const daysSinceActivated = Math.floor((Date.now() - activatedDate.getTime()) / (1000 * 60 * 60 * 24));
-      return daysSinceActivated > BGV_DUE_DAYS;
-    }).length;
-    
-    // Certification statistics
-    const demoCert = activeProctors.filter(p => p.demo_ready === 'pass').length;
-    const assessCert = activeProctors.filter(p => p.assessment_ready === 'pass').length;
-
-    const stats = {
-      total: activeProctors.length,
-      inProgress: activeProctors.filter((p) => p.status === 'In Progress').length,
-      verified: activeProctors.filter((p) => p.status === 'Verified').length,
-      active: activeProctors.filter((p) => p.status === 'Active').length,
-      offboarded: allProctors.filter((p) => p.status === 'Offboarded').length,
-      interviewSelects,
-      bgvMissing: bgvMissing.length,
-      bgvOverdue,
-      demoCert,
-      assessCert,
-      byVendor: {} as Record<string, any>,
+    return data as {
+      total: number;
+      inProgress: number;
+      verified: number;
+      active: number;
+      offboarded: number;
+      interviewSelects: number;
+      bgvMissing: number;
+      bgvOverdue: number;
+      demoCert: number;
+      assessCert: number;
+      byVendor: Record<string, {
+        total: number;
+        inProgress: number;
+        active: number;
+        bgvMissing: number;
+        bgvOverdue: number;
+        demoCert: number;
+        assessCert: number;
+      }>;
     };
-
-    // Count by ALL unique vendors found in data (like HTML app using VENDORS.map)
-    const allVendors = [...new Set(allProctors.map(p => p.vendor || p.managed_by).filter(Boolean))];
-    
-    allVendors.forEach((v) => {
-      const vendorProctors = activeProctors.filter(p => (p.vendor || p.managed_by) === v);
-      const vendorBgvMissing = vendorProctors.filter(p => p.status === 'Active' && !p.bgv);
-      const vendorBgvOverdue = vendorBgvMissing.filter(p => {
-        if (!p.aat) return false;
-        const activatedDate = new Date(p.aat);
-        const daysSinceActivated = Math.floor((Date.now() - activatedDate.getTime()) / (1000 * 60 * 60 * 24));
-        return daysSinceActivated > BGV_DUE_DAYS;
-      }).length;
-      
-      stats.byVendor[v] = {
-        total: vendorProctors.length,
-        inProgress: vendorProctors.filter(p => p.status === 'In Progress').length,
-        active: vendorProctors.filter(p => p.status === 'Active').length,
-        bgvMissing: vendorBgvMissing.length,
-        bgvOverdue: vendorBgvOverdue,
-        demoCert: vendorProctors.filter(p => p.demo_ready === 'pass').length,
-        assessCert: vendorProctors.filter(p => p.assessment_ready === 'pass').length,
-      };
-    });
-
-    return stats;
   },
 
   /**
    * Upload file to Supabase storage
+   */
+  /**
+   * Uploads a file and returns its storage path (not a public URL) -- the bucket
+   * is private, so viewing it later means minting a short-lived signed URL at
+   * view time, the same pattern the nda-signing bucket already uses.
    */
   async uploadFile(
     bucket: string,
@@ -257,11 +215,6 @@ export const proctorService = {
       throw new Error(error.message);
     }
 
-    // Return public URL
-    const { data: urlData } = supabase.storage
-      .from(bucket)
-      .getPublicUrl(data.path);
-
-    return urlData.publicUrl;
+    return data.path;
   },
 };

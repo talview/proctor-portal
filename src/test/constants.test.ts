@@ -40,14 +40,14 @@ describe('STATUS_COLORS', () => {
   it('Active maps to success', () => {
     expect(STATUS_COLORS['Active']).toBe('success');
   });
-  it('Offboarded maps to danger', () => {
-    expect(STATUS_COLORS['Offboarded']).toBe('danger');
+  it('Offboarded maps to neutral', () => {
+    expect(STATUS_COLORS['Offboarded']).toBe('neutral');
   });
-  it('In Progress maps to warning', () => {
-    expect(STATUS_COLORS['In Progress']).toBe('warning');
+  it('In Progress maps to info', () => {
+    expect(STATUS_COLORS['In Progress']).toBe('info');
   });
-  it('Verified maps to info', () => {
-    expect(STATUS_COLORS['Verified']).toBe('info');
+  it('Verified maps to warning', () => {
+    expect(STATUS_COLORS['Verified']).toBe('warning');
   });
   it('Archived maps to secondary', () => {
     expect(STATUS_COLORS['Archived']).toBe('secondary');
@@ -68,8 +68,8 @@ describe('STATUS_BADGES', () => {
   it('Active badge contains success class', () => {
     expect(STATUS_BADGES['Active']).toContain('success');
   });
-  it('Offboarded badge contains danger class', () => {
-    expect(STATUS_BADGES['Offboarded']).toContain('danger');
+  it('Offboarded badge contains a neutral (text3) class', () => {
+    expect(STATUS_BADGES['Offboarded']).toContain('text3');
   });
 });
 

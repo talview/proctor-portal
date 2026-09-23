@@ -17,15 +17,21 @@ interface EligibilityResult {
   skipReason?: string
 }
 
-function checkPreOnboardingEligibility(p: any): EligibilityResult {
+function checkPreOnboardingEligibility(p: any, _inProgressProctorIds: Set<string>): EligibilityResult {
   if (!p.email) return { eligible: false, skipReason: 'No email on file' }
   if (p.form_status === 'submitted') return { eligible: false, skipReason: 'Form already submitted' }
   return { eligible: true }
 }
 
-function checkOnboardingDocsEligibility(p: any): EligibilityResult {
+function checkOnboardingDocsEligibility(p: any, inProgressProctorIds: Set<string>): EligibilityResult {
   if (!p.email) return { eligible: false, skipReason: 'No email on file' }
   if (p.nda_status === 'NDA Signed') return { eligible: false, skipReason: 'NDA already signed' }
+  // Matches dispatchOnboardingDocs' own guard (dispatch.ts) -- caught here too so a
+  // candidate mid-signing shows as correctly Skipped in this job's counts, not
+  // Failed for hitting a guard we already know would refuse them.
+  if (inProgressProctorIds.has(p.id)) {
+    return { eligible: false, skipReason: 'NDA/docs session already in progress' }
+  }
   if (p.demo_ready !== 'pass' || p.assessment_ready !== 'pass') {
     return { eligible: false, skipReason: 'Demo and Assessment must both pass first' }
   }
@@ -79,6 +85,18 @@ serve(async (req) => {
       .in('id', uniqueProctorIds)
     if (fetchError) throw fetchError
 
+    // One bulk fetch of who's already mid-NDA/docs-session -- only relevant for the
+    // docs job type, but harmless (and cheap) to skip otherwise.
+    const inProgressProctorIds = new Set<string>()
+    if (jobType === 'send_onboarding_docs') {
+      const { data: liveSessions } = await supabase
+        .from('nda_signing_sessions')
+        .select('proctor_id')
+        .in('proctor_id', uniqueProctorIds)
+        .in('status', ['otp_verified', 'consented', 'signing', 'signed'])
+      for (const s of liveSessions || []) inProgressProctorIds.add(s.proctor_id)
+    }
+
     const items: { proctor_id: string; status: string; skip_reason: string | null }[] = []
     let eligibleCount = 0
     let skippedCount = 0
@@ -90,7 +108,7 @@ serve(async (req) => {
         skippedCount++
         continue
       }
-      const result = checkEligibility(proctor)
+      const result = checkEligibility(proctor, inProgressProctorIds)
       if (result.eligible) {
         items.push({ proctor_id: id, status: 'queued', skip_reason: null })
         eligibleCount++
@@ -145,6 +163,12 @@ serve(async (req) => {
         })
       }
     } else {
+      // Re-arms the cron backstop (it self-unschedules once idle -- see migration
+      // 0051) -- fast, and has to actually happen before returning, since this job's
+      // eventual completion depends on the cron existing if the immediate kick below
+      // doesn't finish it.
+      await supabase.rpc('ensure_bulk_dispatch_cron')
+
       // Fast first burst of progress -- not awaited, and bounded by nothing the client
       // waits on. The 1-minute cron (drain-bulk-dispatch-queue) is what guarantees this
       // job eventually completes even if this kick doesn't finish it.

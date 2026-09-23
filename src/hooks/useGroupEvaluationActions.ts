@@ -11,11 +11,15 @@ import type { Evaluation, Proctor } from '@/types';
 
 /**
  * Download/upload behavior for a Group Assessment session (a Multi Assign batch --
- * every member shares one group_id, see EvaluationsPage's BulkAssessment). Shared by
- * every place a group can be opened (Workspace's Upcoming Tasks and Scheduled Events
- * tabs) so both behave identically -- one implementation, not two that can drift.
+ * every member shares one group_id, see EvaluationsPage's BulkAssessment). Used by
+ * ScheduledEventsPage's GroupEvaluationModal, the only place evaluating actually
+ * happens (Workspace itself is read-only -- see ScheduleBoard's doc comment).
  */
-export function useGroupEvaluationActions(items: Evaluation[], proctors: Proctor[]) {
+export function useGroupEvaluationActions(
+  items: Evaluation[],
+  proctors: Proctor[],
+  onSaved?: (updatedItems: Evaluation[]) => void
+) {
   const { user } = useAuthStore();
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
@@ -30,7 +34,7 @@ export function useGroupEvaluationActions(items: Evaluation[], proctors: Proctor
           evaluationId: task.id,
           proctorName: proctor?.name || 'Unknown',
           proctorEmail: proctor?.email || '',
-          vendor: proctor?.vendor || proctor?.managed_by || '',
+          vendor: proctor?.vendor || '',
           ptype: proctor?.ptype || '',
           attemptNumber: task.attempt_number,
           result: task.result || null,
@@ -106,13 +110,40 @@ export function useGroupEvaluationActions(items: Evaluation[], proctors: Proctor
           detail: `${task.eval_type} Attempt #${task.attempt_number}: ${row.result}${row.comment ? ` — ${row.comment}` : ''} · via group upload · by ${user?.username || user?.name || 'system'}`,
           user: user?.username || user?.name || null,
         });
+        return row;
       });
 
       const succeeded = results.filter((r) => r.status === 'fulfilled').length;
       const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
 
-      await queryClient.invalidateQueries({ queryKey: ['workspace-tasks'] });
-      await queryClient.invalidateQueries({ queryKey: ['scheduled-events'] });
+      // Patch the just-saved rows into a fresh copy of `items` and hand it back so the
+      // still-open modal can show real results instead of "Pending" for everyone --
+      // without this, the admin sees the success toast but the list in front of them
+      // never visibly changes, since `items` is otherwise a static snapshot from when
+      // the modal opened.
+      if (onSaved) {
+        const byRowId = new Map(
+          results.flatMap((r) => (r.status === 'fulfilled' ? [[r.value.evaluationId, r.value] as const] : []))
+        );
+        onSaved(
+          items.map((task) => {
+            const row = byRowId.get(task.id);
+            if (!row) return task;
+            return {
+              ...task,
+              result: row.result as Evaluation['result'],
+              comment: row.comment,
+              score_obtained: row.scoreObtained ?? undefined,
+            };
+          })
+        );
+      }
+
+      // 'workspace-schedule' is the query that actually backs the board this modal
+      // opens from (see WorkspacePage.tsx) -- 'workspace-tasks'/'scheduled-events' were
+      // its pre-refactor names and match no live query, so invalidating them was a
+      // silent no-op that left the board behind this modal stale until a manual reload.
+      await queryClient.invalidateQueries({ queryKey: ['workspace-schedule'] });
       await queryClient.invalidateQueries({ queryKey: ['evaluations-results'] });
 
       const parts = [`${succeeded} saved`];

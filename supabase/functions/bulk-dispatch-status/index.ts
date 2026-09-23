@@ -82,7 +82,7 @@ serve(async (req) => {
       // shouldn't keep showing up next to a proctor's name forever.
       let query = supabase
         .from('bulk_dispatch_items')
-        .select('proctor_id, status, failure_reason, job_id, bulk_dispatch_jobs!inner(job_type, created_at)')
+        .select('proctor_id, status, failure_reason, job_id, attempted_at, bulk_dispatch_jobs!inner(job_type, created_at)')
         .in('proctor_id', proctorIds)
         .in('status', ['processing', 'failed'])
         .order('created_at', { ascending: false })

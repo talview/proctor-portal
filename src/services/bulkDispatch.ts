@@ -6,6 +6,9 @@ export type BulkItemStatus = 'queued' | 'processing' | 'sent' | 'failed' | 'skip
 
 export interface BulkDispatchJob {
   id: string;
+  /** Human-readable sequential number ("Bulk Activity #N") -- the uuid id isn't
+   * something a person can refer back to. */
+  seq: number;
   job_type: BulkJobType;
   status: 'processing' | 'completed';
   created_by: string;

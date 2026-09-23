@@ -1,0 +1,23 @@
+-- The 'nda-signing' bucket holds NDA templates, signed PDFs, certificates,
+-- signatures, and every proctor's own submitted documents (resume, passport
+-- photo, grad cert, aadhaar/PAN copies, eye test) -- migration 0012's own
+-- comment claimed "proctor-facing reads/writes go through edge functions...
+-- never a direct client storage grant," but that was only true for
+-- candidates. ProctorsPage.tsx's admin document-replace/view feature called
+-- supabase.storage.from('nda-signing') directly from the browser, which only
+-- worked because these two policies grant it to *any* authenticated user --
+-- any role, any path, no vendor scoping -- not just admins correcting their
+-- own proctors' files.
+--
+-- That feature has been moved to the new proctor-document-url edge function
+-- (service-role client, enforces the same admin/coordinator-any-proctor /
+-- vendor-own-vendor-only rule proctors_select RLS already enforces
+-- elsewhere), so these broad grants are no longer depended on by anything --
+-- every remaining reader/writer of this bucket (nda-session-upload-url,
+-- nda-jobs-worker, _shared/ndaVerify.ts, _shared/ndaPdf.ts,
+-- proctor-document-url) already uses the service-role client, which bypasses
+-- RLS regardless of what policies exist. Dropping them with nothing added in
+-- their place is intentional: authenticated (non-service-role) callers should
+-- have zero direct access to this bucket.
+drop policy if exists "Allow authenticated read nda-signing" on storage.objects;
+drop policy if exists "Allow authenticated upload nda-signing" on storage.objects;

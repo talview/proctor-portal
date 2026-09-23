@@ -1,12 +1,14 @@
 /* Self-hosted (via @fontsource) rather than loaded from Google's CDN at
    runtime -- no external font request, works on networks that block it. */
-@import '@fontsource/dm-sans/300.css';
-@import '@fontsource/dm-sans/400.css';
-@import '@fontsource/dm-sans/500.css';
-@import '@fontsource/dm-sans/600.css';
-@import '@fontsource/dm-sans/700.css';
-@import '@fontsource/dm-mono/400.css';
-@import '@fontsource/dm-mono/500.css';
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/inter/700.css';
+@import '@fontsource/lexend/500.css';
+@import '@fontsource/lexend/600.css';
+@import '@fontsource/lexend/700.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
 @import '@fontsource/dancing-script/600.css';
 @import '@fontsource/caveat/600.css';
 @import '@fontsource/great-vibes/400.css';
@@ -15,6 +17,53 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ============ THEME TOKENS ============
+   Every Tailwind color class (bg-surface, text-text2, border-border, ...)
+   resolves through one of these -- see tailwind.config.js's `themeColor()`.
+   Light values are the app's existing palette (unchanged) with the accent
+   swapped to the new violet; dark values are a separate, hand-tuned palette,
+   not an automatic invert -- .dark is applied to <html> by useUIStore's theme
+   state (see src/components/ThemeProvider.tsx). */
+:root {
+  /* A visibly grey page ground against pure-white cards is what actually reads
+     as "structure" at a glance -- the previous bg (248 250 252, nearly white
+     itself) sat close enough to surface's pure white that pages read flat, with
+     no clear separation between chrome and content. */
+  --color-bg: 238 240 245;
+  --color-surface: 255 255 255;
+  --color-surface2: 235 237 243;
+  --color-surface3: 226 232 240;
+  --color-border: 225 228 236;
+  --color-border2: 201 206 218;
+  --color-accent: 74 61 224;
+  --color-accent5: 124 58 237;
+  --color-text: 15 23 42;
+  --color-text2: 71 85 105;
+  --color-text3: 100 116 139;
+  --color-success: 21 128 61;
+  --color-warning: 180 83 9;
+  --color-danger: 185 28 28;
+  --color-info: 3 105 161;
+}
+
+.dark {
+  --color-bg: 21 23 31;
+  --color-surface: 28 31 42;
+  --color-surface2: 35 39 51;
+  --color-surface3: 42 47 63;
+  --color-border: 42 47 63;
+  --color-border2: 58 65 84;
+  --color-accent: 139 128 255;
+  --color-accent5: 178 144 255;
+  --color-text: 234 235 242;
+  --color-text2: 158 166 184;
+  --color-text3: 109 116 136;
+  --color-success: 61 214 140;
+  --color-warning: 240 180 41;
+  --color-danger: 255 107 87;
+  --color-info: 79 180 245;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -22,9 +71,9 @@
 }
 
 body {
-  font-family: 'DM Sans', sans-serif;
-  background-color: #f4f7fb;
-  color: #0f172a;
+  font-family: 'Inter', sans-serif;
+  background-color: rgb(var(--color-bg));
+  color: rgb(var(--color-text));
   min-height: 100vh;
   font-size: 14px;
 }
@@ -36,15 +85,40 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: #e2e8f0;
+  background: rgb(var(--color-surface2));
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #94a3b8;
+  background: rgb(var(--color-border2));
   border-radius: 3px;
 }
 
 /* Gradient background for login */
 .bg-gradient-radial {
-  background: radial-gradient(ellipse at 30% 40%, #1e3a8a 0%, #f4f7fb 70%);
+  background: radial-gradient(ellipse at 30% 40%, rgb(var(--color-accent)) 0%, rgb(var(--color-bg)) 70%);
+}
+
+/* Short fade-and-drop entrance for the notification panel (and any other
+   floating popover that wants the same feel) -- disabled under
+   prefers-reduced-motion instead of forcing motion on everyone. */
+@keyframes fade-drop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-fade-drop-in {
+  animation: fade-drop-in 160ms ease-out;
+  transform-origin: top right;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-drop-in {
+    animation: none;
+  }
 }

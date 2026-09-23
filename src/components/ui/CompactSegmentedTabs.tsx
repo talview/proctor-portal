@@ -6,13 +6,12 @@ export interface CompactSegmentedTabOption {
   icon?: ComponentType<{ className?: string }>;
 }
 
-/** Third navigation tier -- for a sub-tab nested inside a primary in-page tab (e.g.
- * Individual Assign/Multi Assign inside Assessment, inside the Certification page
- * switcher). Deliberately smaller and lighter-weight than both tiers above it:
- * SegmentedTabs (page switcher) fills the active item solid blue; UnderlineTabs
- * (primary in-page tabs) has no container at all. This one keeps a compact pill
- * container but the active item gets a white/light fill with blue text instead of a
- * solid color, so it reads as a step down in visual weight, not a repeat of either. */
+/** A sub-tab nested inside a primary in-page tab (e.g. Individual Assign/Multi
+ * Assign inside Assessment, inside Certification's own top-level tabs).
+ * Deliberately lighter-weight than UnderlineTabs (primary in-page tabs, which has
+ * no container at all): a compact pill container where the active item gets a
+ * white/light fill with blue text instead of a solid color, so it reads as a step
+ * down in visual weight rather than a repeat of it. */
 export default function CompactSegmentedTabs({
   options,
   value,

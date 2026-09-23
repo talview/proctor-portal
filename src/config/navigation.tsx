@@ -6,7 +6,6 @@ import {
   Users,
   UserMinus,
   UserPlus,
-  UserRoundArrowLeft,
   FileWarning,
   Award,
   FileCheck2,
@@ -15,10 +14,7 @@ import {
   UserCog,
   FileText,
   ScrollText,
-  Home,
-  ClipboardList,
-  ShieldCheck,
-  Settings,
+  CalendarCheck2,
 } from 'lucide-react';
 
 export interface NavItem {
@@ -28,57 +24,48 @@ export interface NavItem {
 }
 
 export interface NavSection {
+  /** Empty for the top, ungrouped block (Dashboard/Workspace) -- rendered with
+   * no group label, matching the artifact's sidebar. */
   title: string;
-  icon: ComponentType<{ className?: string }>;
   items: NavItem[];
 }
 
-/** Single source of truth for the nav hierarchy -- the sidebar renders only the
- * section (category) level; PageSwitcher renders the items of whichever section
- * the current route belongs to. Keeping one shared list means the two can never
- * drift out of sync with each other. */
+/** Single source of truth for the nav hierarchy -- the sidebar renders every
+ * item directly, grouped under these section labels (no separate page-switcher
+ * tier: a flat, direct list, matching the Proctor OS artifact's sidebar). */
 export function getNavSections(role?: string): NavSection[] {
   if (role === 'admin') {
     return [
       {
-        title: 'Overview',
-        icon: Home,
+        title: '',
         items: [
-          { label: 'Dashboard', path: '/', icon: LayoutDashboard },
           { label: 'Workspace', path: '/workspace', icon: Briefcase },
+          { label: 'Dashboard', path: '/', icon: LayoutDashboard },
         ],
       },
       {
         title: 'Workforce',
-        icon: UserRoundArrowLeft,
         items: [
           { label: 'Interview Selects', path: '/interview-selects', icon: UserSearch },
+          { label: 'Onboard', path: '/add-proctor', icon: UserPlus },
           { label: 'Proctors', path: '/proctors', icon: Users },
+          { label: 'Incomplete BGV', path: '/incomplete', icon: FileWarning },
           { label: 'Offboarded', path: '/offboarded', icon: UserMinus },
         ],
       },
       {
-        title: 'Onboarding',
-        icon: ClipboardList,
+        title: 'Operations',
         items: [
-          { label: 'Onboard', path: '/add-proctor', icon: UserPlus },
-          { label: 'Incomplete BGV', path: '/incomplete', icon: FileWarning },
-        ],
-      },
-      {
-        title: 'Certification',
-        icon: ShieldCheck,
-        items: [
+          { label: 'Scheduled Events', path: '/scheduled-events', icon: CalendarCheck2 },
           { label: 'Proctor Certification', path: '/evaluations', icon: Award },
           { label: 'Client SOP', path: '/certifications', icon: FileCheck2 },
+          { label: 'Vendors', path: '/vendors', icon: Handshake },
+          { label: 'Customers', path: '/customers', icon: Building2 },
         ],
       },
       {
-        title: 'System',
-        icon: Settings,
+        title: 'Admin',
         items: [
-          { label: 'Customers', path: '/customers', icon: Building2 },
-          { label: 'Vendors', path: '/vendors', icon: Handshake },
           { label: 'Users', path: '/users', icon: UserCog },
           { label: 'NDA Template', path: '/nda-template', icon: FileText },
           { label: 'Audit Log', path: '/audit', icon: ScrollText },
@@ -88,63 +75,53 @@ export function getNavSections(role?: string): NavSection[] {
   } else if (role === 'coordinator') {
     return [
       {
-        title: 'My Workspace',
-        icon: Home,
+        title: '',
         items: [{ label: 'Workspace', path: '/workspace', icon: Briefcase }],
       },
       {
         title: 'Workforce',
-        icon: UserRoundArrowLeft,
         items: [
           { label: 'Interview Selects', path: '/interview-selects', icon: UserSearch },
-          { label: 'Proctors', path: '/my-proctors', icon: Users },
-        ],
-      },
-      {
-        title: 'Onboarding',
-        icon: ClipboardList,
-        items: [
           { label: 'Onboard', path: '/add-proctor', icon: UserPlus },
+          { label: 'Proctors', path: '/my-proctors', icon: Users },
           { label: 'Incomplete BGV', path: '/incomplete', icon: FileWarning },
         ],
       },
       {
-        title: 'Certification',
-        icon: ShieldCheck,
-        items: [{ label: 'Client SOP', path: '/certifications', icon: FileCheck2 }],
+        title: 'Operations',
+        items: [
+          { label: 'Scheduled Events', path: '/scheduled-events', icon: CalendarCheck2 },
+          { label: 'Client SOP', path: '/certifications', icon: FileCheck2 },
+        ],
       },
     ];
   }
   return [
     {
-      title: 'Overview',
-      icon: Home,
+      title: '',
       items: [{ label: 'Dashboard', path: '/', icon: LayoutDashboard }],
     },
     {
-      title: 'My Proctors',
-      icon: Users,
+      title: 'Workforce',
       items: [
         { label: 'Interview Selects', path: '/interview-selects', icon: UserSearch },
         { label: 'Proctors', path: '/my-proctors', icon: Users },
+        { label: 'Incomplete BGV', path: '/incomplete', icon: FileWarning },
       ],
     },
     {
-      title: 'Onboarding',
-      icon: ClipboardList,
-      items: [{ label: 'Incomplete BGV', path: '/incomplete', icon: FileWarning }],
-    },
-    {
-      title: 'Certification',
-      icon: ShieldCheck,
+      title: 'Operations',
       items: [{ label: 'Client SOP', path: '/certifications', icon: FileCheck2 }],
     },
   ];
 }
 
-/** Which section (if any) the current path belongs to. */
-export function findActiveSection(sections: NavSection[], pathname: string): NavSection | undefined {
-  return sections.find((s) =>
-    s.items.some((i) => (i.path === '/' ? pathname === '/' : pathname.startsWith(i.path)))
-  );
+/** Which nav item (if any) the current path is on -- drives both the sidebar's
+ * active-row highlight and the topbar's page-title crumb. */
+export function findActiveItem(sections: NavSection[], pathname: string): NavItem | undefined {
+  for (const section of sections) {
+    const item = section.items.find((i) => (i.path === '/' ? pathname === '/' : pathname.startsWith(i.path)));
+    if (item) return item;
+  }
+  return undefined;
 }

@@ -1,19 +1,24 @@
 import { useRef, useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Video, FileEdit, BarChart3, Download, CheckCircle2, User, Users, Upload, AlertTriangle, RefreshCw, Save, ExternalLink, ChevronDown, History } from 'lucide-react';
+import { Video, FileEdit, BarChart3, Download, CheckCircle2, User, Users, Upload, AlertTriangle, RefreshCw, Save, ExternalLink, ChevronDown, History, XCircle } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
-import { usePaginatedQuery } from '@/hooks/usePaginatedQuery';
+import { useCursorPaginatedQuery } from '@/hooks/useCursorPaginatedQuery';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import { logAudit } from '@/services/audit';
-import { downloadCsv } from '@/lib/csv';
+import { downloadCsv, parseCsv } from '@/lib/csv';
+import { localDateString } from '@/utils/formatters';
+import { orIlikeFilter } from '@/utils/postgrest';
 import { showAlert } from '@/components/ui/GlobalDialog';
 import { PROCTOR_TYPES, EVAL_REASON_OPTIONS_BY_RESULT } from '@/utils/constants';
-import { useManagedByOptions } from '@/hooks/useManagedByOptions';
+import { useVendorOptions } from '@/hooks/useVendorOptions';
+import { useAssessmentReadyProctors } from '@/hooks/useAssessmentReadyProctors';
+import { runWithConcurrency } from '@/utils/concurrency';
 import ClearFiltersButton from '@/components/ui/ClearFiltersButton';
 import UnderlineTabs from '@/components/ui/UnderlineTabs';
 import CompactSegmentedTabs from '@/components/ui/CompactSegmentedTabs';
@@ -70,6 +75,9 @@ function usePanelUsers() {
       if (error) throw error;
       return (data || []).map((u: any) => u.username).filter(Boolean) as string[];
     },
+    // Who's a coordinator/admin changes rarely -- no need to refetch on every mount
+    // or window refocus. A new user account will show up here within 5 minutes.
+    staleTime: 5 * 60_000,
   });
 }
 
@@ -86,7 +94,7 @@ function DemoTab() {
   const { user } = useAuthStore();
   const isVendor = user?.role === 'vendor';
   const { data: panelUsers = [] } = usePanelUsers();
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
 
   // Fetch proctors with demo_ready = 'ready'
   const { data: proctors = [], isLoading } = useQuery({
@@ -94,15 +102,12 @@ function DemoTab() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('proctors')
-        .select('id, name, email, managed_by, vendor, ptype, demo_ready_attempt, at')
+        .select('id, name, email, vendor, ptype, demo_ready_attempt, at')
         .eq('demo_ready', 'ready')
         .order('at', { ascending: false });
 
       if (error) throw error;
-      return (data as Proctor[]).map(p => ({
-        ...p,
-        vendor: p.managed_by || p.vendor || ''
-      }));
+      return data as Proctor[];
     },
   });
 
@@ -114,7 +119,7 @@ function DemoTab() {
       if (!scoreOutOf || Number(scoreOutOf) < 1) throw new Error('Enter a valid score out of');
 
       const now = new Date();
-      const today = now.toISOString().slice(0, 10);
+      const today = localDateString(now);
       if (scheduledDate < today) throw new Error('Cannot schedule on a past date');
       if (scheduledDate === today) {
         const [h, m] = scheduledTime.split(':').map(Number);
@@ -182,7 +187,7 @@ function DemoTab() {
     }
 
     downloadCsv(
-      `demo_ready_list_${new Date().toISOString().slice(0, 10)}.csv`,
+      `demo_ready_list_${localDateString()}.csv`,
       ['Name', 'Vendor', 'Type', 'Demo Status', 'Attempts'],
       filteredProctors.map((p) => [
         p.name || '',
@@ -226,7 +231,7 @@ function DemoTab() {
           <Select
             options={[
               { value: '', label: 'All Vendors' },
-              ...managedByOptions,
+              ...vendorOptions,
             ]}
             value={vendorFilter}
             onChange={(e) => setVendorFilter(e.target.value)}
@@ -253,15 +258,6 @@ function DemoTab() {
         <Button variant="ghost" size="sm" onClick={exportReadyList}>
 <Download className="w-3.5 h-3.5" /> Export
         </Button>
-        <label className="flex items-center gap-2 text-xs text-text2 cursor-pointer whitespace-nowrap">
-          <input
-            type="checkbox"
-            checked={selectedProctors.size === filteredProctors.length && filteredProctors.length > 0}
-            onChange={(e) => handleSelectAll(e.target.checked)}
-            className="accent-accent"
-          />
-          Select All
-        </label>
       </div>
 
       {/* Info Banner */}
@@ -271,43 +267,62 @@ function DemoTab() {
 
       {/* Table */}
       <div className="mb-4">
-        <Table
+        <DataTable
           data={filteredProctors}
           isLoading={isLoading}
           emptyMessage="No proctors ready for demo"
           columns={[
             {
-              header: '',
-              accessor: (proctor) => (
+              id: 'select',
+              // A header checkbox toggles all, matching every other selectable table
+              // in the app (ProctorsPage, InterviewSelectsPage) -- this used to be a
+              // separate "Select All" button/label floating in the toolbar above,
+              // which looked inconsistent with the rest of the app's tables.
+              header: () => (
                 <input
                   type="checkbox"
-                  checked={selectedProctors.has(proctor.id)}
-                  onChange={() => toggleProctor(proctor.id)}
-                  className="accent-accent"
+                  checked={selectedProctors.size === filteredProctors.length && filteredProctors.length > 0}
+                  onChange={(e) => handleSelectAll(e.target.checked)}
+                  className="w-3.5 h-3.5 accent-accent cursor-pointer"
                 />
               ),
-              className: 'w-8',
+              enableSorting: false,
+              meta: { className: 'w-8' },
+              cell: ({ row }) => (
+                <input
+                  type="checkbox"
+                  checked={selectedProctors.has(row.original.id)}
+                  onChange={() => toggleProctor(row.original.id)}
+                  className="w-3.5 h-3.5 accent-accent cursor-pointer"
+                />
+              ),
             },
-            { header: 'Name', accessor: (proctor) => proctor.name, className: 'text-[13px] text-text font-semibold' },
-            { header: 'Vendor', accessor: (proctor) => proctor.vendor, className: 'text-[12px] text-text2' },
+            { id: 'name', header: 'Name', enableSorting: false, cell: ({ row }) => row.original.name, meta: { className: 'text-[13px] text-text font-semibold' } },
+            { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original.vendor, meta: { className: 'text-[12px] text-text2' } },
             {
+              id: 'ptype',
               header: 'Type',
-              accessor: (proctor) => (
+              enableSorting: false,
+              cell: ({ row }) => (
                 <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-info/10 text-info">
-                  {proctor.ptype}
+                  {row.original.ptype}
                 </span>
               ),
             },
             {
+              id: 'demo_status',
               header: 'Demo Status',
-              accessor: () => <span className="text-[11px] font-bold text-info">Ready</span>,
+              enableSorting: false,
+              cell: () => <span className="text-[11px] font-bold text-info">Ready</span>,
             },
             {
+              id: 'attempts',
               header: 'Attempts',
-              accessor: (proctor) => proctor.demo_ready_attempt || 0,
-              className: 'text-[12px] text-text3',
+              enableSorting: false,
+              cell: ({ row }) => row.original.demo_ready_attempt || 0,
+              meta: { className: 'text-[12px] text-text3' },
             },
-          ]}
+          ] satisfies ColumnDef<Proctor, any>[]}
         />
       </div>
 
@@ -411,25 +426,11 @@ function IndividualAssessment() {
   const { user } = useAuthStore();
   const isVendor = user?.role === 'vendor';
   const { data: panelUsers = [] } = usePanelUsers();
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
 
-  // Fetch proctors with assessment_ready = 'ready'
-  const { data: proctors = [], isLoading } = useQuery({
-    queryKey: ['assessment-ready-proctors'],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from('proctors')
-        .select('id, name, email, managed_by, vendor, ptype, assessment_ready_attempt, at')
-        .eq('assessment_ready', 'ready')
-        .order('at', { ascending: false });
-
-      if (error) throw error;
-      return (data as Proctor[]).map(p => ({
-        ...p,
-        vendor: p.managed_by || p.vendor || ''
-      }));
-    },
-  });
+  // Fetch proctors with assessment_ready = 'ready' -- shared with BulkAssessment so
+  // switching between the two sub-tabs reuses one cache entry instead of refetching.
+  const { data: proctors = [], isLoading } = useAssessmentReadyProctors();
 
   const selectedProctorData = proctors.find((p) => p.id === selectedProctor) || null;
 
@@ -442,7 +443,7 @@ function IndividualAssessment() {
       if (!scoreOutOf || Number(scoreOutOf) < 1) throw new Error('Enter a valid score out of');
 
       const now = new Date();
-      const today = now.toISOString().slice(0, 10);
+      const today = localDateString(now);
       if (scheduledDate < today) throw new Error('Cannot schedule on a past date');
       if (scheduledDate === today) {
         const [h, m] = scheduledTime.split(':').map(Number);
@@ -506,7 +507,7 @@ function IndividualAssessment() {
     }
 
     downloadCsv(
-      `assessment_ready_list_${new Date().toISOString().slice(0, 10)}.csv`,
+      `assessment_ready_list_${localDateString()}.csv`,
       ['Name', 'Vendor', 'Type', 'Assessment Status', 'Attempts'],
       filteredProctors.map((p) => [
         p.name || '',
@@ -532,7 +533,7 @@ function IndividualAssessment() {
           <Select
             options={[
               { value: '', label: 'All Vendors' },
-              ...managedByOptions,
+              ...vendorOptions,
             ]}
             value={vendorFilter}
             onChange={(e) => setVendorFilter(e.target.value)}
@@ -568,44 +569,52 @@ function IndividualAssessment() {
 
       {/* Table */}
       <div className="mb-4">
-        <Table
+        <DataTable
           data={filteredProctors}
           isLoading={isLoading}
           emptyMessage="No proctors ready for assessment"
           columns={[
             {
+              id: 'select',
               header: '',
-              accessor: (proctor) => (
+              enableSorting: false,
+              meta: { className: 'w-8' },
+              cell: ({ row }) => (
                 <input
                   type="radio"
                   name="assessProctor"
-                  checked={selectedProctor === proctor.id}
-                  onChange={() => setSelectedProctor(proctor.id)}
+                  checked={selectedProctor === row.original.id}
+                  onChange={() => setSelectedProctor(row.original.id)}
                   className="accent-accent"
                 />
               ),
-              className: 'w-8',
             },
-            { header: 'Name', accessor: (proctor) => proctor.name, className: 'text-[13px] text-text font-semibold' },
-            { header: 'Vendor', accessor: (proctor) => proctor.vendor, className: 'text-[12px] text-text2' },
+            { id: 'name', header: 'Name', enableSorting: false, cell: ({ row }) => row.original.name, meta: { className: 'text-[13px] text-text font-semibold' } },
+            { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original.vendor, meta: { className: 'text-[12px] text-text2' } },
             {
+              id: 'ptype',
               header: 'Type',
-              accessor: (proctor) => (
+              enableSorting: false,
+              cell: ({ row }) => (
                 <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-info/10 text-info">
-                  {proctor.ptype}
+                  {row.original.ptype}
                 </span>
               ),
             },
             {
+              id: 'assessment_status',
               header: 'Assessment Status',
-              accessor: () => <span className="text-[11px] font-bold text-info">Ready</span>,
+              enableSorting: false,
+              cell: () => <span className="text-[11px] font-bold text-info">Ready</span>,
             },
             {
+              id: 'attempts',
               header: 'Attempts',
-              accessor: (proctor) => proctor.assessment_ready_attempt || 0,
-              className: 'text-[12px] text-text3',
+              enableSorting: false,
+              cell: ({ row }) => row.original.assessment_ready_attempt || 0,
+              meta: { className: 'text-[12px] text-text3' },
             },
-          ]}
+          ] satisfies ColumnDef<Proctor, any>[]}
         />
       </div>
 
@@ -617,7 +626,7 @@ function IndividualAssessment() {
           </div>
           {selectedProctorData && (
             <div className="text-xs text-text2 mb-4">
-              Selected: <strong className="text-text">{selectedProctorData.name}</strong> · {selectedProctorData.vendor || selectedProctorData.managed_by} · {selectedProctorData.ptype}
+              Selected: <strong className="text-text">{selectedProctorData.name}</strong> · {selectedProctorData.vendor} · {selectedProctorData.ptype}
             </div>
           )}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
@@ -676,18 +685,24 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const { data: panelUsers = [] } = usePanelUsers();
 
-  const { data: proctors = [] } = useQuery({
-    queryKey: ['bulk-assessment-ready'],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from('proctors')
-        .select('id, email, name, vendor, managed_by, ptype, assessment_ready')
-        .eq('assessment_ready', 'ready')
-        .order('at', { ascending: false });
-      if (error) throw error;
-      return (data as Proctor[]).map((p) => ({ ...p, vendor: p.managed_by || p.vendor || '' }));
-    },
-  });
+  // Preview state -- selecting a file only ever parses/validates it into this; nothing
+  // is scheduled until the admin explicitly clicks "Confirm & Schedule" below, mirroring
+  // every other bulk-CSV flow in this app (Interview Selects import, AddProctorPage's
+  // bulk upload). Uploading used to go straight from file-select to live scheduling
+  // with no review step at all.
+  const [csvRows, setCsvRows] = useState<Array<{
+    email: string;
+    proctor?: Proctor;
+    name: string;
+    vendor: string;
+    ptype: string;
+    _ok: boolean;
+    _errors: string[];
+  }> | null>(null);
+  const [scheduling, setScheduling] = useState(false);
+
+  // Shared with IndividualAssessment -- same filter/columns, one cache entry.
+  const { data: proctors = [] } = useAssessmentReadyProctors();
 
   const downloadTemplate = () => {
     if (!panelUser || !scheduledDate || !scheduledTime || !scoreOutOf || Number(scoreOutOf) < 1) {
@@ -702,7 +717,7 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
 
     downloadCsv(
       `assessment_assign_${scheduledDate}.csv`,
-      ['email', 'proctor_name', 'managed_by', 'ptype'],
+      ['Email', 'Name', 'Vendor', 'Type'],
       ready.map((p) => [p.email || '', p.name || '', p.vendor || '', p.ptype || ''])
     );
     showAlert(`Downloaded ${ready.length} ready proctors. Delete rows you don't need, then upload the edited file back.`, { tone: 'success' });
@@ -714,7 +729,10 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
     });
   };
 
-  const uploadTemplate = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Parses and validates the uploaded file into the preview below -- does not schedule
+  // anything. That only happens if the admin reviews the table and clicks "Confirm &
+  // Schedule".
+  const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -726,43 +744,63 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
     }
 
     const text = await file.text();
-    const lines = text.trim().split('\n');
-    if (lines.length < 2) {
+    const parsed = parseCsv(text);
+    if (parsed.length < 2) {
       showAlert('File appears empty', { tone: 'error' });
+      e.target.value = '';
       return;
     }
 
-    const header = lines[0].split(',').map((h) => h.trim().toLowerCase().replace(/"/g, ''));
+    const header = parsed[0].map((h) => h.toLowerCase());
     const emailIdx = header.indexOf('email');
     if (emailIdx < 0) {
       showAlert('CSV must have an email column', { tone: 'error' });
+      e.target.value = '';
       return;
     }
 
-    const rows = lines.slice(1).map((line) => {
-      const values = line.match(/(".*?"|[^,]+)(?=\s*,|\s*$)/g)?.map((v) => v.replace(/^"|"$/g, '').trim()) || [];
+    // Tracks emails already seen earlier in this same file -- without this, two rows
+    // for the same proctor both pass validation and both get scheduled concurrently
+    // (runWithConcurrency has no per-proctor locking), producing two "attempt #1"
+    // rows for one proctor in the same batch.
+    const seenInFile = new Set<string>();
+
+    const rows = parsed.slice(1).map((values) => {
       const email = values[emailIdx]?.trim().toLowerCase() || '';
       const proctor = proctors.find((p) => (p.email || '').toLowerCase() === email);
       const errors: string[] = [];
       if (!email) errors.push('Missing email');
+      else if (seenInFile.has(email)) errors.push('Duplicate email in this file');
+      else seenInFile.add(email);
       if (!proctor) errors.push('Proctor not found in portal');
       else if (proctor.assessment_ready !== 'ready') errors.push(`No longer in Ready status (${proctor.assessment_ready || 'unknown'})`);
       return { email, proctor, name: proctor?.name || '—', vendor: proctor?.vendor || '—', ptype: proctor?.ptype || '—', _ok: errors.length === 0, _errors: errors };
     }).filter((r) => r.email);
 
-    const validRows = rows.filter((r) => r._ok);
-    if (!validRows.length) {
-      showAlert('Nothing to import', { tone: 'error' });
+    if (!rows.length) {
+      showAlert('No rows with an email found in that file', { tone: 'error' });
+      e.target.value = '';
       return;
     }
 
+    setCsvRows(rows);
+    e.target.value = '';
+  };
+
+  const confirmSchedule = async () => {
+    const cfg = bulkAssessConfig;
+    if (!csvRows || !cfg?.panel || !cfg?.date) return;
+    const validRows = csvRows.filter((r) => r._ok);
+    if (!validRows.length) return;
+
+    setScheduling(true);
     // One group_id shared by every candidate in this batch -- this is what makes the
     // upload a single group schedule (one shared session other coordinators/admins can
     // open as one unit in Workspace) rather than N unrelated individual schedules. Each
     // candidate still gets their own proctor_evaluations row/attempt/history; group_id
     // only ties them together as one session.
     const groupId = crypto.randomUUID();
-    await Promise.all(validRows.map(async (row) => {
+    const results = await runWithConcurrency(validRows, 4, async (row) => {
       const { data: attempt, error: scheduleError } = await supabase.rpc('schedule_evaluation', {
         p_proctor_id: row.proctor!.id,
         p_eval_type: 'assessment',
@@ -780,10 +818,23 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
         detail: `Panel: ${cfg.panel} · Attempt ${attempt} · ${cfg.date} ${cfg.time} · by ${user?.username || user?.name || 'system'}`,
         user: user?.username || user?.name || null,
       });
-    }));
+    });
+    setScheduling(false);
 
-    showAlert(`${validRows.length} assessment(s) scheduled for ${cfg.panel}`, { tone: 'success' });
-    e.target.value = '';
+    // runWithConcurrency never throws on a per-row failure (unlike the Promise.all
+    // this replaced), so failures have to be surfaced explicitly here instead of
+    // relying on an uncaught rejection to skip the success message below.
+    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+    const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    if (failed.length === 0) {
+      showAlert(`${succeeded} assessment(s) scheduled for ${cfg.panel}`, { tone: 'success' });
+    } else {
+      showAlert(
+        `${succeeded} scheduled, ${failed.length} failed (e.g. ${failed[0].reason?.message || 'unknown error'})`,
+        { tone: succeeded > 0 ? 'info' : 'error' }
+      );
+    }
+    setCsvRows(null);
   };
 
   return (
@@ -836,7 +887,7 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
         Download the full list of Assessment Ready proctors. <strong>Delete the rows you don't want to assign</strong>, keep only those for this session, then upload the edited file back.
       </p>
       <p className="text-text3 text-[11px] mb-3">
-        Columns: <code className="bg-surface2 px-1.5 py-0.5 rounded text-[10px]">email, proctor_name, managed_by, ptype</code> — do not add or rename columns.
+        Columns: <code className="bg-surface2 px-1.5 py-0.5 rounded text-[10px]">Email, Name, Vendor, Type</code> — do not add or rename columns.
       </p>
 
       <div className="flex gap-2 flex-wrap">
@@ -855,9 +906,68 @@ function BulkAssessment({ bulkAssessConfig, setBulkAssessConfig }: {
           type="file"
           accept=".csv"
           className="hidden"
-          onChange={uploadTemplate}
+          onChange={handleFileSelected}
         />
       </div>
+
+      {csvRows && (
+        <div className="mt-6 pt-6 border-t border-border">
+          <h3 className="text-sm font-semibold text-text uppercase tracking-wide mb-2">
+            Step 3 — Review &amp; Confirm
+          </h3>
+          <p className="text-text2 text-xs mb-3">
+            {csvRows.filter((r) => r._ok).length} of {csvRows.length} row{csvRows.length === 1 ? '' : 's'} ready to
+            schedule for <strong>{bulkAssessConfig?.panel}</strong> on {bulkAssessConfig?.date} {bulkAssessConfig?.time}.
+            Nothing is scheduled until you confirm below.
+          </p>
+          <div className="mb-4">
+            <DataTable
+              data={csvRows}
+              rowClassName={(r) => (r._ok ? '' : 'bg-danger/5')}
+              columns={[
+                { id: 'email', header: 'Email', enableSorting: false, cell: ({ row }) => row.original.email, meta: { className: 'text-text2' } },
+                { id: 'name', header: 'Name', enableSorting: false, cell: ({ row }) => row.original.name, meta: { className: 'font-semibold text-text' } },
+                { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original.vendor, meta: { className: 'text-text2' } },
+                { id: 'ptype', header: 'Type', enableSorting: false, cell: ({ row }) => row.original.ptype, meta: { className: 'text-text2' } },
+                {
+                  id: 'status',
+                  header: 'Status',
+                  enableSorting: false,
+                  cell: ({ row }) => {
+                    const r = row.original;
+                    return r._ok ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold text-success">
+                        <CheckCircle2 className="w-3 h-3" /> OK
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold text-danger" title={r._errors.join(', ')}>
+                        <XCircle className="w-3 h-3" /> {r._errors[0]}
+                      </span>
+                    );
+                  },
+                },
+              ] satisfies ColumnDef<typeof csvRows[number], any>[]}
+            />
+          </div>
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={confirmSchedule}
+              disabled={scheduling || csvRows.filter((r) => r._ok).length === 0}
+            >
+              {scheduling ? (
+                'Scheduling...'
+              ) : (
+                <><CheckCircle2 className="w-3.5 h-3.5" /> Confirm &amp; Schedule {csvRows.filter((r) => r._ok).length}</>
+              )}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setCsvRows(null)} disabled={scheduling}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -892,9 +1002,8 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
   const [vendorFilter, setVendorFilter] = useState('');
   const [overrideEvaluation, setOverrideEvaluation] = useState<any | null>(null);
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
-  const [page, setPage] = useState(1);
   const PAGE_SIZE = 25;
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
 
   const isAdmin = user?.role === 'admin';
   const isVendor = user?.role === 'vendor';
@@ -912,7 +1021,16 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
   // now be paginated correctly (a plain client-side group-by over a full fetch
   // couldn't be, since a page boundary would split one proctor's attempts across
   // pages instead of splitting between proctors).
-  const { data: pageResult, isLoading, isFetching } = usePaginatedQuery<any>({
+  const {
+    data: pagedEvaluations,
+    isLoading,
+    isFetching,
+    hasNextPage,
+    hasPreviousPage,
+    goToNextPage,
+    goToPreviousPage,
+    pageIndex,
+  } = useCursorPaginatedQuery<any>({
     queryKey: ['evaluations-results', type, resultFilter, vendorFilter],
     table: 'latest_evaluation_per_proctor',
     filters: (q) => {
@@ -923,14 +1041,14 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
     },
     searchColumns: ['proctor_name', 'proctor_email'],
     searchTerm: debouncedSearch,
-    page,
     pageSize: PAGE_SIZE,
     orderBy: { column: 'created_at', ascending: false },
-    countMode: 'estimated',
+    resetKey: `${resultFilter}|${vendorFilter}`,
+    // Narrowed from select('*') -- verified against every field ResultsTable and
+    // OverrideModal actually read; proctor_id/group_id/created_by/status aren't used
+    // anywhere in this tab.
+    select: 'id, proctor_name, proctor_email, proctor_vendor, proctor_type, eval_type, panel_user, scheduled_date, scheduled_time, result, attempt_number, comment, score_obtained, score_out_of, certified_date, overridden_by, overridden_at, session_code, candidate_id, section_id, result_url, history',
   });
-
-  const pagedEvaluations = pageResult?.data ?? [];
-  const totalCount = pageResult?.count ?? 0;
 
   const toggleHistory = (id: string) => {
     setExpandedHistory((prev) => {
@@ -949,7 +1067,7 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
     if (vendorFilter) query = query.eq('proctor_vendor', vendorFilter);
     if (debouncedSearch.trim()) {
       const term = debouncedSearch.trim();
-      query = query.or(`proctor_name.ilike.%${term}%,proctor_email.ilike.%${term}%`);
+      query = query.or(orIlikeFilter(['proctor_name', 'proctor_email'], term));
     }
     const { data, error } = await query;
     if (error) return showAlert('Failed to export: ' + error.message, { tone: 'error' });
@@ -959,7 +1077,7 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
     }
 
     downloadCsv(
-      `eval_${type}_${new Date().toISOString().slice(0, 10)}.csv`,
+      `eval_${type}_${localDateString()}.csv`,
       ['Proctor Name', 'Email', 'Vendor', 'Proctor Type', 'Eval Type', 'Panel', 'Scheduled Date', 'Attempt', 'Result', 'Comment', 'Certified Date'],
       (data as any[]).map((evaluation) => [
         evaluation.proctor_name || '—',
@@ -1023,10 +1141,7 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
         <Input
           placeholder="Name, email..."
           value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setPage(1);
-          }}
+          onChange={(e) => setSearch(e.target.value)}
           wrapperClassName="flex-1 min-w-[180px]"
         />
         <Select
@@ -1038,23 +1153,17 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
             { value: 'Reschedule', label: 'Reschedule' },
           ]}
           value={resultFilter}
-          onChange={(e) => {
-            setResultFilter(e.target.value);
-            setPage(1);
-          }}
+          onChange={(e) => setResultFilter(e.target.value)}
           wrapperClassName="min-w-[140px]"
         />
         {!isVendor && (
           <Select
             options={[
               { value: '', label: 'All Vendors' },
-              ...managedByOptions,
+              ...vendorOptions,
             ]}
             value={vendorFilter}
-            onChange={(e) => {
-              setVendorFilter(e.target.value);
-              setPage(1);
-            }}
+            onChange={(e) => setVendorFilter(e.target.value)}
             wrapperClassName="min-w-[160px]"
           />
         )}
@@ -1064,7 +1173,6 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
             setSearch('');
             setResultFilter('');
             setVendorFilter('');
-            setPage(1);
           }}
         />
         <Button variant="ghost" size="sm" onClick={exportResults}>
@@ -1073,46 +1181,69 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
       </div>
 
       {/* Table */}
-      <Table
+      <DataTable
         data={pagedEvaluations}
         isLoading={isLoading}
+        // Non-admin has no action here (sees "Recorded", not an Override button --
+        // see the actions column below), so the row itself is only clickable for
+        // admin, same gating as the button it duplicates.
+        onRowClick={isAdmin ? handleOverride : undefined}
         emptyMessage={`No ${type} results recorded yet`}
-        pagination={{ page, pageSize: PAGE_SIZE, count: totalCount, isFetching, onPageChange: setPage }}
+        pagination={{
+          pageIndex,
+          pageSize: PAGE_SIZE,
+          hasNextPage,
+          hasPreviousPage,
+          isFetching,
+          onNext: goToNextPage,
+          onPrevious: goToPreviousPage,
+        }}
         columns={[
           {
+            id: 'proctor',
             header: 'Proctor',
-            accessor: (evaluation) => (
+            enableSorting: false,
+            cell: ({ row }) => (
               <div>
-                <div className="text-[13px] text-text font-semibold">{evaluation.proctor_name}</div>
-                <div className="text-[11px] text-text3">{evaluation.proctor_vendor}</div>
+                <div className="text-[13px] text-text font-semibold">{row.original.proctor_name}</div>
+                <div className="text-[11px] text-text3">{row.original.proctor_vendor}</div>
               </div>
             ),
           },
-          { header: 'Panel', accessor: (evaluation) => evaluation.panel_user || '—', className: 'text-[12px] text-text2' },
+          { id: 'panel', header: 'Panel', enableSorting: false, cell: ({ row }) => row.original.panel_user || '—', meta: { className: 'text-[12px] text-text2' } },
           {
+            id: 'scheduled',
             header: 'Scheduled',
-            accessor: (evaluation) => formatDateTime(evaluation.scheduled_date, evaluation.scheduled_time),
-            className: 'text-[12px] text-text3',
+            enableSorting: false,
+            cell: ({ row }) => formatDateTime(row.original.scheduled_date, row.original.scheduled_time),
+            meta: { className: 'text-[12px] text-text3' },
           },
           {
+            id: 'score',
             header: 'Score',
-            accessor: (evaluation) =>
-              evaluation.score_obtained != null
-                ? `${evaluation.score_obtained}${evaluation.score_out_of ? '/' + evaluation.score_out_of : ''}`
+            enableSorting: false,
+            cell: ({ row }) =>
+              row.original.score_obtained != null
+                ? `${row.original.score_obtained}${row.original.score_out_of ? '/' + row.original.score_out_of : ''}`
                 : '—',
-            className: 'font-mono text-[12px] text-text2',
+            meta: { className: 'font-display tabular-nums text-[12px] text-text2' },
           },
           {
+            id: 'certified_date',
             header: 'Certified Date',
-            accessor: (evaluation) =>
-              evaluation.result === 'Pass'
-                ? formatDateTime(evaluation.certified_date || evaluation.scheduled_date)
+            enableSorting: false,
+            cell: ({ row }) =>
+              row.original.result === 'Pass'
+                ? formatDateTime(row.original.certified_date || row.original.scheduled_date)
                 : '—',
-            className: 'text-[12px] text-success',
+            meta: { className: 'text-[12px] text-success' },
           },
           {
+            id: 'attempt',
             header: 'Attempt',
-            accessor: (evaluation) => {
+            enableSorting: false,
+            cell: ({ row }) => {
+              const evaluation = row.original;
               const history = evaluation.history || [];
               const hasHistory = history.length > 0;
               const isExpanded = expandedHistory.has(evaluation.id);
@@ -1123,7 +1254,7 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
                   </span>
                   {hasHistory && (
                     <button
-                      onClick={() => toggleHistory(evaluation.id)}
+                      onClick={(e) => { e.stopPropagation(); toggleHistory(evaluation.id); }}
                       title={`${history.length} earlier attempt${history.length === 1 ? '' : 's'}`}
                       className="inline-flex items-center gap-0.5 text-text3 hover:text-accent text-[10px] font-semibold"
                     >
@@ -1137,16 +1268,19 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
             },
           },
           {
+            id: 'result',
             header: 'Result',
-            accessor: (evaluation) => (
+            enableSorting: false,
+            cell: ({ row }) => (
               <div className="flex items-center gap-1.5">
-                {getResultBadge(evaluation.result, evaluation.overridden_by, evaluation.overridden_at)}
-                {evaluation.result_url && (
+                {getResultBadge(row.original.result, row.original.overridden_by, row.original.overridden_at)}
+                {row.original.result_url && (
                   <a
-                    href={evaluation.result_url}
+                    href={row.original.result_url}
                     target="_blank"
                     rel="noreferrer"
                     title="Open evidence"
+                    onClick={(e) => e.stopPropagation()}
                     className="text-text3 hover:text-accent"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
@@ -1156,22 +1290,26 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
             ),
           },
           {
+            id: 'comment',
             header: 'Comment',
-            accessor: (evaluation) => evaluation.comment || '—',
-            className: 'text-[12px] text-text2 max-w-xs truncate',
+            enableSorting: false,
+            cell: ({ row }) => row.original.comment || '—',
+            meta: { className: 'text-[12px] text-text2 max-w-xs truncate' },
           },
           {
+            id: 'actions',
             header: 'Actions',
-            accessor: (evaluation) =>
+            enableSorting: false,
+            cell: ({ row }) =>
               isAdmin ? (
-                <Button variant="ghost" size="sm" onClick={() => handleOverride(evaluation)}>
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); handleOverride(row.original); }}>
                   <RefreshCw className="w-3.5 h-3.5" /> Override
                 </Button>
               ) : (
                 <span className="text-text3 text-[11px]">Recorded</span>
               ),
           },
-        ]}
+        ] satisfies ColumnDef<any, any>[]}
         renderExpandedRow={(evaluation) =>
           expandedHistory.has(evaluation.id) &&
           (evaluation.history || []).map((past: any) => (
@@ -1182,7 +1320,7 @@ function ResultsTable({ type }: { type: 'demo' | 'assessment' }) {
               <td className="px-3.5 py-2 text-[12px] text-text3">
                 {formatDateTime(past.scheduled_date, past.scheduled_time)}
               </td>
-              <td className="px-3.5 py-2 font-mono text-[12px] text-text2">
+              <td className="px-3.5 py-2 font-display tabular-nums text-[12px] text-text2">
                 {past.score_obtained != null
                   ? `${past.score_obtained}${past.score_out_of ? '/' + past.score_out_of : ''}`
                   : '—'}

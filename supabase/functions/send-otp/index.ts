@@ -9,6 +9,7 @@ const corsHeaders = {
 }
 
 const MAX_RESENDS = 8
+const OTP_COOLDOWN_SECONDS = 30
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -58,31 +59,21 @@ serve(async (req) => {
       throw new Error('Too many code requests for this link. Contact your coordinator.')
     }
 
+    // Short cooldown between clicks -- MAX_RESENDS alone doesn't stop someone from
+    // mashing "resend" and burning through that lifetime cap in seconds.
+    if (proctor.form_otp_last_sent_at) {
+      const secondsSinceLastSend = (Date.now() - new Date(proctor.form_otp_last_sent_at).getTime()) / 1000
+      if (secondsSinceLastSend < OTP_COOLDOWN_SECONDS) {
+        throw new Error(`Please wait a moment before requesting another code (${Math.ceil(OTP_COOLDOWN_SECONDS - secondsSinceLastSend)}s).`)
+      }
+    }
+
     // Generate new OTP -- crypto.getRandomValues-based (not Math.random()), stored
     // hashed (not plaintext), matching the NDA signing OTP's already-reviewed design.
     const otp = generateOtp()
     const otpHash = await hashOtp(otp)
     const otpExpiresAt = new Date()
     otpExpiresAt.setMinutes(otpExpiresAt.getMinutes() + 10) // 10 minutes validity
-
-    // Update proctor with OTP
-    const { error: updateError } = await supabaseClient
-      .from('proctors')
-      .update({
-        form_otp_hash: otpHash,
-        form_otp_expires_at: otpExpiresAt.toISOString(),
-        form_otp_attempts: 0, // per-code attempts -- fine to reset, the code itself just changed
-        form_otp_send_count: (proctor.form_otp_send_count || 0) + 1, // lifetime -- never reset
-        form_access_count: (proctor.form_access_count || 0) + 1,
-        upd: new Date().toISOString(),
-      })
-      .eq('id', proctor.id)
-
-    if (updateError) {
-      throw updateError
-    }
-
-    await logAuditEntry(supabaseClient, proctor.email, 'Onboarding OTP Sent', proctor.name || proctor.id, `Code sent to ${proctor.email}`)
 
     // Mask email for display
     const emailParts = proctor.email.split('@')
@@ -148,7 +139,29 @@ If you did not request this code, you can ignore this message.
 
 Sent automatically by Talview Proctor Portal.`
 
+    // Sent BEFORE any OTP state is committed -- this used to write the new hash/
+    // send-count/cooldown first and only then attempt the send, so a Mailgun
+    // failure after that write left the candidate with no code delivered but a
+    // burned resend attempt and an active cooldown anyway. Ordering it this way
+    // means a failed send throws (caught below) before anything is persisted, so
+    // a retry-the-click genuinely gets a fresh attempt instead of a wasted one.
     await sendMailgunEmail(proctor.email, 'Talview verification code', emailHtml, emailText)
+
+    const { error: updateError } = await supabaseClient
+      .from('proctors')
+      .update({
+        form_otp_hash: otpHash,
+        form_otp_expires_at: otpExpiresAt.toISOString(),
+        form_otp_attempts: 0, // per-code attempts -- fine to reset, the code itself just changed
+        form_otp_send_count: (proctor.form_otp_send_count || 0) + 1, // lifetime -- never reset
+        form_otp_last_sent_at: new Date().toISOString(),
+        form_access_count: (proctor.form_access_count || 0) + 1,
+        upd: new Date().toISOString(),
+      })
+      .eq('id', proctor.id)
+    if (updateError) throw updateError
+
+    await logAuditEntry(supabaseClient, proctor.email, 'Onboarding OTP Sent', proctor.name || proctor.id, `Code sent to ${proctor.email}`)
 
     return new Response(
       JSON.stringify({

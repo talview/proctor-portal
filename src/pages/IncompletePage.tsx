@@ -3,16 +3,19 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Clock, Paperclip, Upload, XCircle, Loader2, FileText, RefreshCw } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
-import { usePaginatedQuery } from '@/hooks/usePaginatedQuery';
+import { useCursorPaginatedQuery } from '@/hooks/useCursorPaginatedQuery';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import VendorTypeCell from '@/components/ui/VendorTypeCell';
+import Badge from '@/components/ui/Badge';
+import type { ColumnDef } from '@tanstack/react-table';
 import { proctorService } from '@/services/proctor';
 import { logAudit } from '@/services/audit';
 import { getScopedVendor } from '@/utils/access';
-import { useManagedByOptions } from '@/hooks/useManagedByOptions';
+import { useVendorOptions } from '@/hooks/useVendorOptions';
 import { showAlert } from '@/components/ui/GlobalDialog';
 import ClearFiltersButton from '@/components/ui/ClearFiltersButton';
 import UnderlineTabs from '@/components/ui/UnderlineTabs';
@@ -23,7 +26,7 @@ import type { Proctor } from '@/types';
  * PID -- it fetches this itself for every proctor in the system (see the
  * `incomplete-bgv-all-for-match` query below), independent of the main list's
  * pagination/search/tab filters. */
-type BulkMatchProctor = Pick<Proctor, 'id' | 'pid' | 'name' | 'email' | 'managed_by' | 'vendor'>;
+type BulkMatchProctor = Pick<Proctor, 'id' | 'pid' | 'name' | 'email' | 'vendor'>;
 
 // Concurrent BGV uploads in flight at once during a bulk upload -- was a strictly
 // sequential upload -> RPC -> audit loop before, one file fully completing before the
@@ -41,13 +44,12 @@ export default function IncompletePage() {
   const [bgvFileError, setBgvFileError] = useState('');
   const [showBulkUpload, setShowBulkUpload] = useState(false);
   const [bgvFilter, setBgvFilter] = useState<'pending' | 'uploaded'>('pending');
-  const [page, setPage] = useState(1);
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const PAGE_SIZE = 25;
 
   const isVendor = user?.role === 'vendor';
   const scopedVendor = getScopedVendor(user);
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
 
   // Debounce search so typing doesn't fire a request per keystroke now that search is
   // server-side instead of an instant client-side filter (mirrors ProctorsPage/AuditLogPage).
@@ -65,17 +67,24 @@ export default function IncompletePage() {
   // Server-side paginated + searched (was a flat fetch-everything-then-filter, see
   // migration history for context). Vendor scoping, the status/vendor filters, and the
   // Pending/Uploaded tab all move into the query itself.
-  const { data: pageResult, isLoading, isFetching } = usePaginatedQuery<Proctor>({
+  const {
+    data: normalizedPage,
+    isLoading,
+    isFetching,
+    hasNextPage,
+    hasPreviousPage,
+    goToNextPage,
+    goToPreviousPage,
+    pageIndex,
+  } = useCursorPaginatedQuery<Proctor>({
     queryKey: ['incomplete-bgv', scopedVendor, bgvFilter, statusFilter, vendorFilter],
     table: 'proctors',
     filters: (q) => {
       let query = q.neq('status', 'Archived').neq('status', 'Interview Selected');
       // Vendor sees only their proctors.
-      if (scopedVendor) query = query.or(`vendor.eq.${scopedVendor},managed_by.eq.${scopedVendor}`);
+      if (scopedVendor) query = query.eq('vendor', scopedVendor);
       if (statusFilter) query = query.eq('status', statusFilter);
-      // `vendor` in this list is really `managed_by || vendor` (normalized below), so
-      // the vendor filter has to check both underlying columns.
-      if (vendorFilter) query = query.or(`managed_by.eq.${vendorFilter},vendor.eq.${vendorFilter}`);
+      if (vendorFilter) query = query.eq('vendor', vendorFilter);
       // Pending: Active proctors with no bgv on file (null or empty string).
       // Uploaded: any proctor with a non-empty bgv on file.
       if (bgvFilter === 'pending') {
@@ -85,17 +94,16 @@ export default function IncompletePage() {
       }
       return query;
     },
-    // Vendor isn't its own real column value here -- it's managed_by||vendor -- so
-    // both underlying columns are searched alongside name.
-    searchColumns: ['name', 'managed_by', 'vendor'],
+    searchColumns: ['name', 'vendor'],
     searchTerm: debouncedSearch,
-    page,
     pageSize: PAGE_SIZE,
     orderBy: { column: 'at', ascending: true },
+    resetKey: `${bgvFilter}|${statusFilter}|${vendorFilter}`,
+    // Narrowed from select('*') -- verified against this tab's table columns and
+    // getBgvDueInfo(row); the bulk BGV-match modal already runs its own separate,
+    // already-narrow query (allProctorsForBulkMatch above) independent of this one.
+    select: 'id, pid, name, at, aat, bgv, ptype, status, vendor',
   });
-
-  const totalCount = pageResult?.count ?? 0;
-  const normalizedPage = (pageResult?.data ?? []).map((p) => ({ ...p, vendor: p.managed_by || p.vendor || '' }));
 
   // Tab-count badges can no longer be derived from a single page's worth of rows --
   // each gets its own lightweight count-only query, vendor-scoped the same way the
@@ -112,7 +120,7 @@ export default function IncompletePage() {
         .neq('status', 'Interview Selected')
         .eq('status', 'Active')
         .or('bgv.is.null,bgv.eq.');
-      if (scopedVendor) q = q.or(`vendor.eq.${scopedVendor},managed_by.eq.${scopedVendor}`);
+      if (scopedVendor) q = q.eq('vendor', scopedVendor);
       const { count, error } = await q;
       if (error) throw error;
       return count || 0;
@@ -129,7 +137,7 @@ export default function IncompletePage() {
         .neq('status', 'Interview Selected')
         .not('bgv', 'is', null)
         .neq('bgv', '');
-      if (scopedVendor) q = q.or(`vendor.eq.${scopedVendor},managed_by.eq.${scopedVendor}`);
+      if (scopedVendor) q = q.eq('vendor', scopedVendor);
       const { count, error } = await q;
       if (error) throw error;
       return count || 0;
@@ -146,13 +154,13 @@ export default function IncompletePage() {
     queryFn: async () => {
       let q = supabase
         .from('proctors')
-        .select('id, pid, name, email, managed_by, vendor')
+        .select('id, pid, name, email, vendor')
         .neq('status', 'Archived')
         .neq('status', 'Interview Selected');
-      if (scopedVendor) q = q.or(`vendor.eq.${scopedVendor},managed_by.eq.${scopedVendor}`);
+      if (scopedVendor) q = q.eq('vendor', scopedVendor);
       const { data, error } = await q;
       if (error) throw error;
-      return (data as BulkMatchProctor[]).map((p) => ({ ...p, vendor: p.managed_by || p.vendor || '' }));
+      return data as BulkMatchProctor[];
     },
     enabled: showBulkUpload,
   });
@@ -188,7 +196,7 @@ export default function IncompletePage() {
   };
 
   // Sort by status priority (Active first, then Verified, In Progress, Offboarded).
-  // NOTE -- pagination tradeoff: usePaginatedQuery's `orderBy` only takes one real
+  // NOTE -- pagination tradeoff: useCursorPaginatedQuery's `orderBy` only takes one real
   // column (PostgREST/.order() doesn't support a CASE-based priority expression), so
   // this status-priority ordering can't be applied server-side across the whole
   // result set before it's split into pages. Rather than add a DB column or view
@@ -213,18 +221,18 @@ export default function IncompletePage() {
     return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
   };
 
-  const getStatusBadge = (status: string) => {
-    const colors: Record<string, string> = {
-      'Active': 'bg-success/10 text-success',
-      'In Progress': 'bg-warning/10 text-warning',
-      'Verified': 'bg-info/10 text-info',
-      'Offboarded': 'bg-danger/10 text-danger',
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[11px] font-semibold ${colors[status] || 'bg-text3/10 text-text3'}`}>
-        {status}
-      </span>
-    );
+  // bgv-documents is a private bucket -- proctors.bgv stores a bare storage path, not
+  // a working URL, so viewing it means minting a short-lived signed URL on click (same
+  // pattern as ProctorsPage's openSignedDocument for the nda-signing bucket).
+  const openBgvDocument = async (path: string) => {
+    const { data, error } = await supabase.storage
+      .from('bgv-documents')
+      .createSignedUrl(path, 300);
+    if (error || !data?.signedUrl) {
+      showAlert('Could not open this file: ' + (error?.message || 'unknown error'), { tone: 'error' });
+      return;
+    }
+    window.open(data.signedUrl, '_blank', 'noopener,noreferrer');
   };
 
   const uploadMutation = useMutation({
@@ -269,47 +277,49 @@ export default function IncompletePage() {
     },
   });
 
-  const bgvColumns = [
+  const bgvColumns: ColumnDef<Proctor, any>[] = [
     {
+      id: 'name',
       header: 'Name',
-      accessor: (row: Proctor) => (
+      enableSorting: false,
+      cell: ({ row }) => (
         <div>
-          <div className="font-semibold text-text">{row.name}</div>
-          {row.pid && <div className="font-mono text-[11px] text-text3">{row.pid}</div>}
+          <div className="font-semibold text-text">{row.original.name}</div>
+          {row.original.pid && <div className="font-mono text-[11px] text-text3">{row.original.pid}</div>}
         </div>
       ),
     },
     {
-      header: 'Vendor / Type',
-      accessor: (row: Proctor) => (
-        <span className="text-[12px] text-text2 font-medium">
-          {row.vendor || '—'}
-          {row.vendor && row.ptype && <span className="text-text3 mx-1">|</span>}
-          {row.ptype}
-        </span>
-      ),
+      id: 'vendor_type',
+      header: 'Vendor',
+      enableSorting: false,
+      cell: ({ row }) => <VendorTypeCell vendor={row.original.vendor} ptype={row.original.ptype} />,
     },
-    { header: 'Status', accessor: (row: Proctor) => getStatusBadge(row.status) },
+    { id: 'status', header: 'Status', enableSorting: false, cell: ({ row }) => <Badge status={row.original.status} /> },
     {
+      id: 'date',
       header: bgvFilter === 'pending' ? 'Activated' : 'Added',
-      accessor: (row: Proctor) => (
-        <span className="text-xs text-text2">{formatDate(bgvFilter === 'pending' ? row.aat! : row.at)}</span>
+      enableSorting: false,
+      cell: ({ row }) => (
+        <span className="text-xs text-text2">{formatDate(bgvFilter === 'pending' ? row.original.aat! : row.original.at)}</span>
       ),
     },
     {
+      id: 'due_or_document',
       header: bgvFilter === 'pending' ? 'Due' : 'Document',
-      accessor: (row: Proctor) => {
+      enableSorting: false,
+      cell: ({ row }) => {
         if (bgvFilter === 'uploaded') {
           return (
             <button
               className="inline-flex items-center gap-1 text-xs font-semibold text-accent hover:underline"
-              onClick={() => window.open(row.bgv!, '_blank', 'noopener,noreferrer')}
+              onClick={() => openBgvDocument(row.original.bgv!)}
             >
               <FileText className="w-3.5 h-3.5" /> View Document
             </button>
           );
         }
-        const dueInfo = getBgvDueInfo(row);
+        const dueInfo = getBgvDueInfo(row.original);
         return (
           <span className={`inline-flex items-center gap-1 text-xs font-bold px-2.5 py-1 rounded ${dueInfo.bgColor} ${dueInfo.color}`}>
             <Clock className="w-3.5 h-3.5" /> {dueInfo.label}
@@ -318,11 +328,14 @@ export default function IncompletePage() {
       },
     },
     {
+      id: 'action',
       header: 'Action',
-      accessor: (row: Proctor) => {
+      enableSorting: false,
+      cell: ({ row }) => {
+        const proctor = row.original;
         if (bgvFilter === 'uploaded') {
-          return row.status === 'Active' ? (
-            <Button variant="ghost" size="sm" onClick={() => setUploadProctor(row)} className="!text-[11px] !px-2 !py-1">
+          return proctor.status === 'Active' ? (
+            <Button variant="ghost" size="sm" onClick={() => setUploadProctor(proctor)} className="!text-[11px] !px-2 !py-1">
               <Paperclip className="w-3.5 h-3.5" /> Replace
             </Button>
           ) : null;
@@ -330,7 +343,7 @@ export default function IncompletePage() {
         // This tab is already scoped to Active proctors -- BGV isn't collectible
         // before activation.
         return (
-          <Button variant="primary" size="sm" onClick={() => setUploadProctor(row)} className="!text-[11px] !px-2 !py-1">
+          <Button variant="primary" size="sm" onClick={() => setUploadProctor(proctor)} className="!text-[11px] !px-2 !py-1">
             <Paperclip className="w-3.5 h-3.5" /> Upload BGV
           </Button>
         );
@@ -348,20 +361,14 @@ export default function IncompletePage() {
             { label: `Uploaded (${uploadedCount})`, value: 'uploaded', icon: CheckCircle2 },
           ]}
           value={bgvFilter}
-          onChange={(v) => {
-            setBgvFilter(v);
-            setPage(1);
-          }}
+          onChange={(v) => setBgvFilter(v)}
         />
       </div>
       <div className="flex gap-2 mb-4 flex-wrap items-center">
         <Input
           placeholder="Search name..."
           value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setPage(1);
-          }}
+          onChange={(e) => setSearch(e.target.value)}
           wrapperClassName="flex-1 min-w-[180px]"
         />
         <Select
@@ -373,23 +380,17 @@ export default function IncompletePage() {
             { value: 'Offboarded', label: 'Offboarded' },
           ]}
           value={statusFilter}
-          onChange={(e) => {
-            setStatusFilter(e.target.value);
-            setPage(1);
-          }}
+          onChange={(e) => setStatusFilter(e.target.value)}
           wrapperClassName="min-w-[140px]"
         />
         {!isVendor && (
           <Select
             options={[
               { value: '', label: 'All Vendors' },
-              ...managedByOptions,
+              ...vendorOptions,
             ]}
             value={vendorFilter}
-            onChange={(e) => {
-              setVendorFilter(e.target.value);
-              setPage(1);
-            }}
+            onChange={(e) => setVendorFilter(e.target.value)}
             wrapperClassName="min-w-[160px]"
           />
         )}
@@ -399,7 +400,6 @@ export default function IncompletePage() {
             setSearch('');
             setStatusFilter('');
             setVendorFilter('');
-            setPage(1);
           }}
         />
         <Button variant="ghost" size="sm" onClick={() => setShowBulkUpload(true)} className="ml-auto">
@@ -408,7 +408,7 @@ export default function IncompletePage() {
       </div>
 
       {/* Grid */}
-      {bgvFilter === 'pending' && !isLoading && totalCount === 0 ? (
+      {bgvFilter === 'pending' && !isLoading && pageIndex === 0 && normalizedPage.length === 0 ? (
         <div className="bg-surface border border-border rounded-lg p-12 text-center">
           <CheckCircle2 className="w-12 h-12 text-success mx-auto mb-4" />
           <h3 className="text-lg font-semibold text-text mb-2">All complete!</h3>
@@ -417,12 +417,20 @@ export default function IncompletePage() {
           </p>
         </div>
       ) : (
-        <Table
+        <DataTable
           data={sortedProctors}
           columns={bgvColumns}
           isLoading={isLoading}
           emptyMessage={bgvFilter === 'uploaded' ? 'No BGV documents uploaded yet' : 'No proctors with missing BGV documents'}
-          pagination={{ page, pageSize: PAGE_SIZE, count: totalCount, isFetching, onPageChange: setPage }}
+          pagination={{
+            pageIndex,
+            pageSize: PAGE_SIZE,
+            hasNextPage,
+            hasPreviousPage,
+            isFetching,
+            onNext: goToNextPage,
+            onPrevious: goToPreviousPage,
+          }}
         />
       )}
       {uploadProctor && (
@@ -658,14 +666,17 @@ function BulkBgvUploadModal({
         </label>
 
         {matches.length > 0 && (
-          <Table
+          <DataTable
             data={matches}
             columns={[
-              { header: 'File', accessor: (m) => m.file.name, className: 'text-text2 font-mono' },
-              { header: 'Matched Proctor', accessor: (m) => m.matchedProctor?.name || '—', className: 'text-text' },
+              { id: 'file', header: 'File', enableSorting: false, cell: ({ row }) => row.original.file.name, meta: { className: 'text-text2 font-mono' } },
+              { id: 'matched', header: 'Matched Proctor', enableSorting: false, cell: ({ row }) => row.original.matchedProctor?.name || '—', meta: { className: 'text-text' } },
               {
+                id: 'status',
                 header: 'Status',
-                accessor: (m) => {
+                enableSorting: false,
+                cell: ({ row }) => {
+                  const m = row.original;
                   const outcome = m.matchedProctor ? outcomes[m.matchedProctor.id] : undefined;
                   if (outcome?.status === 'success') {
                     return (
@@ -699,7 +710,7 @@ function BulkBgvUploadModal({
                   );
                 },
               },
-            ]}
+            ] satisfies ColumnDef<MatchedFile, any>[]}
           />
         )}
 

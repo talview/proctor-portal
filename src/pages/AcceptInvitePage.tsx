@@ -59,8 +59,10 @@ export default function AcceptInvitePage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-radial from-[#1a2540] via-bg to-bg">
-      <div className="bg-surface border border-border rounded-2xl p-12 w-full max-w-md shadow-2xl">
+    <div className="min-h-screen flex items-center justify-center bg-bg">
+      <div className="bg-surface border border-border rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
+        <div className="h-1.5 bg-gradient-to-r from-accent to-accent5" />
+        <div className="p-12">
         <div className="text-center mb-8">
           <div className="text-[26px] font-extrabold tracking-tight text-text mb-1.5">Talview</div>
           <div className="text-[13px] text-text2 font-medium">Proctor Portal</div>
@@ -80,7 +82,7 @@ export default function AcceptInvitePage() {
         {status === 'success' && (
           <div className="text-center">
             <p className="text-success text-sm font-semibold mb-4">Password set successfully.</p>
-            <a href="/" className="inline-block w-full bg-accent hover:bg-accent/90 text-white font-semibold py-2.5 rounded-md transition-colors">
+            <a href="/" className="inline-block w-full bg-gradient-to-r from-accent to-accent5 hover:brightness-110 text-white font-semibold py-2.5 rounded-md transition-[filter]">
               Continue to Proctor Portal
             </a>
           </div>
@@ -121,7 +123,7 @@ export default function AcceptInvitePage() {
             <button
               type="submit"
               disabled={status === 'saving'}
-              className="w-full bg-accent hover:bg-accent/90 text-white font-semibold py-2.5 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full bg-gradient-to-r from-accent to-accent5 hover:brightness-110 text-white font-semibold py-2.5 rounded-md transition-[filter] disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {status === 'saving' ? 'Saving...' : 'Set Password & Continue'}
             </button>
@@ -131,6 +133,7 @@ export default function AcceptInvitePage() {
             )}
           </form>
         )}
+        </div>
       </div>
     </div>
   );

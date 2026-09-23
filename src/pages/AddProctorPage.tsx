@@ -3,17 +3,26 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { User, Upload, CheckCircle2, AlertTriangle, XCircle, FolderOpen, X, Download } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
+import { calculateAge } from '@/utils/age';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import UnderlineTabs from '@/components/ui/UnderlineTabs';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import FormSection from '@/components/ui/FormSection';
 import { showAlert } from '@/components/ui/GlobalDialog';
 import { getScopedVendor } from '@/utils/access';
+import { parseCsv } from '@/lib/csv';
 import { PROCTOR_TYPES, PROCTOR_TYPE_LABELS, INDIAN_STATES } from '@/utils/constants';
-import { useManagedByOptions } from '@/hooks/useManagedByOptions';
+import { useVendorOptions } from '@/hooks/useVendorOptions';
 import type { Proctor } from '@/types';
+
+const MAX_DOB = (() => {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 18);
+  return d.toISOString().split('T')[0];
+})();
 
 // Onboarding is admin/coordinator only -- vendors only ever see the proctors already
 // assigned to them (My Proctors), never add or bulk-import new ones. Enforced by
@@ -46,8 +55,8 @@ function IndividualTab() {
   const queryClient = useQueryClient();
   const isVendor = user?.role === 'vendor';
   const scopedVendor = getScopedVendor(user);
-  const { data: managedByOptions = [] } = useManagedByOptions();
-  const managedByValues = new Set(managedByOptions.map((option) => option.value));
+  const { data: vendorOptions = [] } = useVendorOptions();
+  const managedByValues = new Set(vendorOptions.map((option) => option.value));
 
   const [formData, setFormData] = useState({
     name: '',
@@ -55,7 +64,7 @@ function IndividualTab() {
     dob: '',
     gender: '',
     ptype: '',
-    managed_by: scopedVendor || '',
+    vendor: scopedVendor || '',
     phone: '',
     email: '',
     city: '',
@@ -72,9 +81,9 @@ function IndividualTab() {
   const { data: existingProctors = [] } = useQuery({
     queryKey: ['proctors-all'],
     queryFn: async () => {
-      let query = supabase.from('proctors').select('id, name, phone, email, vendor, managed_by, status');
+      let query = supabase.from('proctors').select('id, name, phone, email, vendor, status');
       if (scopedVendor) {
-        query = query.eq('vendor', scopedVendor).or(`managed_by.eq.${scopedVendor}`);
+        query = query.eq('vendor', scopedVendor);
       }
       const { data, error } = await query;
       if (error) throw error;
@@ -132,6 +141,12 @@ function IndividualTab() {
     if (!formData.dob) {
       newErrors.dob = 'Date of Birth is required';
       isValid = false;
+    } else if (Number.isNaN(calculateAge(formData.dob))) {
+      newErrors.dob = 'Enter a valid date of birth';
+      isValid = false;
+    } else if (calculateAge(formData.dob) < 18) {
+      newErrors.dob = 'Must be at least 18 years old';
+      isValid = false;
     }
 
     if (!formData.gender) {
@@ -144,11 +159,11 @@ function IndividualTab() {
       isValid = false;
     }
 
-    if (!formData.managed_by) {
-      newErrors.managed_by = 'Managed By is required';
+    if (!formData.vendor) {
+      newErrors.vendor = 'Vendor is required';
       isValid = false;
-    } else if (!isVendor && !managedByValues.has(formData.managed_by)) {
-      newErrors.managed_by = 'Selected Managed By is not active';
+    } else if (!isVendor && !managedByValues.has(formData.vendor)) {
+      newErrors.vendor = 'Selected vendor is not active';
       isValid = false;
     }
 
@@ -187,7 +202,7 @@ function IndividualTab() {
       if (dupPhone.status === 'Offboarded') {
         newErrors.phone = 'Previously offboarded — contact admin to re-onboard';
       } else {
-        newErrors.phone = `Duplicate: ${dupPhone.name} (${dupPhone.managed_by || dupPhone.vendor})`;
+        newErrors.phone = `Duplicate: ${dupPhone.name} (${dupPhone.vendor})`;
       }
       isValid = false;
     }
@@ -197,7 +212,7 @@ function IndividualTab() {
       if (dupEmail.status === 'Offboarded') {
         newErrors.email = 'Previously offboarded — contact admin to re-onboard';
       } else {
-        newErrors.email = `Duplicate: ${dupEmail.name} (${dupEmail.managed_by || dupEmail.vendor})`;
+        newErrors.email = `Duplicate: ${dupEmail.name} (${dupEmail.vendor})`;
       }
       isValid = false;
     }
@@ -242,8 +257,7 @@ function IndividualTab() {
       dob: formData.dob,
       gender: formData.gender as any,
       ptype: formData.ptype as any,
-      managed_by: formData.managed_by as any,
-      vendor: formData.managed_by,
+      vendor: formData.vendor as any,
       phone: formData.phone,
       email: formData.email.trim(),
       city: formData.city.trim(),
@@ -259,7 +273,7 @@ function IndividualTab() {
       dob: '',
       gender: '',
       ptype: '',
-      managed_by: formData.managed_by,
+      vendor: formData.vendor,
       phone: '',
       email: '',
       city: '',
@@ -312,6 +326,7 @@ function IndividualTab() {
                 type="date"
                 value={formData.dob}
                 onChange={(e) => setFormData({ ...formData, dob: e.target.value })}
+                max={MAX_DOB}
               />
               {errors.dob && <div className="text-danger text-xs mt-1">{errors.dob}</div>}
             </div>
@@ -360,13 +375,13 @@ function IndividualTab() {
                 <Select
                 options={[
                     { value: '', label: 'Select Vendor...' },
-                    ...managedByOptions,
+                    ...vendorOptions,
                   ]}
-                  value={formData.managed_by}
-                  onChange={(e) => setFormData({ ...formData, managed_by: e.target.value })}
+                  value={formData.vendor}
+                  onChange={(e) => setFormData({ ...formData, vendor: e.target.value })}
                 />
               )}
-              {errors.managed_by && <div className="text-danger text-xs mt-1">{errors.managed_by}</div>}
+              {errors.vendor && <div className="text-danger text-xs mt-1">{errors.vendor}</div>}
             </div>
           </div>
         </div>
@@ -472,8 +487,8 @@ function BulkTab() {
   const { user } = useAuthStore();
   const queryClient = useQueryClient();
   const isVendor = user?.role === 'vendor';
-  const { data: managedByOptions = [] } = useManagedByOptions();
-  const managedByValues = new Set(managedByOptions.map((option) => option.value));
+  const { data: vendorOptions = [] } = useVendorOptions();
+  const managedByValues = new Set(vendorOptions.map((option) => option.value));
   const [bulkData, setBulkData] = useState<any[]>([]);
   const [isProcessed, setIsProcessed] = useState(false);
   const bulkFileRef = useRef<HTMLInputElement>(null);
@@ -486,7 +501,7 @@ function BulkTab() {
       headers = 'name,aadhaar,dob,gender,ptype,phone,email,city,state,notes';
       example = `"John Doe","123456789012","1990-01-01","Male","ODP","9876543210","john@gmail.com","Mumbai","Maharashtra",""`;
     } else {
-      headers = 'name,aadhaar,dob,gender,ptype,managed_by,phone,email,city,state,notes';
+      headers = 'name,aadhaar,dob,gender,ptype,vendor,phone,email,city,state,notes';
       example = `"John Doe","123456789012","1990-01-01","Male","WFO","Sai","9876543210","john@gmail.com","Mumbai","Maharashtra",""`;
     }
 
@@ -501,38 +516,6 @@ function BulkTab() {
     showAlert('Template downloaded', { tone: 'success' });
   };
 
-  const parseCSV = (text: string) => {
-    const lines: string[][] = [];
-    let cur = '', inQ = false;
-    const chars = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    let row: string[] = [];
-    
-    for (let i = 0; i < chars.length; i++) {
-      const c = chars[i];
-      if (c === '"') {
-        if (inQ && chars[i + 1] === '"') {
-          cur += '"';
-          i++;
-        } else {
-          inQ = !inQ;
-        }
-      } else if (c === ',' && !inQ) {
-        row.push(cur.trim());
-        cur = '';
-      } else if (c === '\n' && !inQ) {
-        row.push(cur.trim());
-        cur = '';
-        if (row.some(v => v !== '')) lines.push(row);
-        row = [];
-      } else {
-        cur += c;
-      }
-    }
-    if (cur || row.length) row.push(cur.trim());
-    if (row.some(v => v !== '')) lines.push(row);
-    return lines;
-  };
-
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -540,7 +523,7 @@ function BulkTab() {
     const reader = new FileReader();
     reader.onload = async (ev) => {
       const text = ev.target?.result as string;
-      const parsed = parseCSV(text);
+      const parsed = parseCsv(text);
 
       if (parsed.length < 2) {
         showAlert('File appears empty or has no data rows', { tone: 'error' });
@@ -553,7 +536,7 @@ function BulkTab() {
         hdrs.forEach((h, i) => {
           obj[h] = (row[i] || '').trim();
           // Normalize Aadhaar and Phone (handle Excel scientific notation)
-          if ((h === 'aadhaar' || h === 'phone') && /^[\d.]+[eE][+\-]?\d+$/.test(obj[h])) {
+          if ((h === 'aadhaar' || h === 'phone') && /^[\d.]+[eE][+-]?\d+$/.test(obj[h])) {
             obj[h] = Math.round(Number(obj[h])).toString();
           }
           obj[h] = obj[h].replace(/\.0+$/, '').trim();
@@ -569,7 +552,7 @@ function BulkTab() {
       // Fetch existing proctors for phone/email duplicate check.
       const { data: existing, error } = await supabase
         .from('proctors')
-        .select('id, name, phone, email, vendor, managed_by, status');
+        .select('id, name, phone, email, vendor, status');
 
       if (error) {
         showAlert('Failed to fetch existing proctors: ' + error.message, { tone: 'error' });
@@ -609,6 +592,8 @@ function BulkTab() {
       if (!r.name || r.name.trim() === '') errs.push('Missing name');
       if (!r.aadhaar || !/^\d{12}$/.test(r.aadhaar)) errs.push('Invalid Aadhaar — must be exactly 12 digits');
       if (!r.dob) errs.push('Missing DOB');
+      else if (Number.isNaN(calculateAge(r.dob))) errs.push('Invalid DOB -- must be a valid date');
+      else if (calculateAge(r.dob) < 18) errs.push('Must be at least 18 years old');
       if (!r.gender) errs.push('Missing gender');
       if (!r.ptype || !['WFO', 'ODP', 'Hybrid'].includes(r.ptype)) errs.push('Invalid proctor type');
       
@@ -619,7 +604,7 @@ function BulkTab() {
           errs.push(`Vendor mismatch — you can only upload for ${vendor}`);
         }
       } else {
-        vendor = r.managed_by || r.vendor;
+        vendor = r.vendor;
         if (vendor && !managedByValues.has(vendor)) errs.push(`Invalid vendor: "${vendor}"`);
       }
       
@@ -643,7 +628,7 @@ function BulkTab() {
         if (dupP.status === 'Offboarded') {
           errs.push(`Phone belongs to offboarded proctor ${dupP.name} — contact admin`);
         } else {
-          errs.push(`Phone already in database (${dupP.name}, ${dupP.managed_by || dupP.vendor})`);
+          errs.push(`Phone already in database (${dupP.name}, ${dupP.vendor})`);
         }
       }
 
@@ -652,7 +637,7 @@ function BulkTab() {
         if (dupE.status === 'Offboarded') {
           errs.push(`Email belongs to offboarded proctor ${dupE.name} — contact admin`);
         } else {
-          errs.push(`Email already in database (${dupE.name}, ${dupE.managed_by || dupE.vendor})`);
+          errs.push(`Email already in database (${dupE.name}, ${dupE.vendor})`);
         }
       }
 
@@ -721,7 +706,6 @@ function BulkTab() {
       dob: r.dob,
       gender: r.gender,
       ptype: r.ptype,
-      managed_by: r._vendor,
       vendor: r._vendor,
       phone: r.phone,
       email: r.email,
@@ -813,29 +797,33 @@ function BulkTab() {
 
             {/* Table Preview */}
             <div className="mb-4">
-              <Table
+              <DataTable
                 data={bulkData}
                 rowClassName={(r: any) => (r._ok ? '' : 'bg-danger/5')}
                 columns={[
-                  { header: '#', accessor: (_r: any, i: number) => i + 1, className: 'text-text3' },
-                  { header: 'Name', accessor: (r: any) => r.name || '—', className: 'font-semibold text-text' },
-                  { header: 'Vendor', accessor: (r: any) => r._vendor || '—', className: 'text-text2' },
-                  { header: 'Phone', accessor: (r: any) => r.phone || '—', className: 'font-mono text-text2' },
+                  { id: 'index', header: '#', enableSorting: false, cell: ({ row }) => row.index + 1, meta: { className: 'text-text3' } },
+                  { id: 'name', header: 'Name', enableSorting: false, cell: ({ row }) => row.original.name || '—', meta: { className: 'font-semibold text-text' } },
+                  { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original._vendor || '—', meta: { className: 'text-text2' } },
+                  { id: 'phone', header: 'Phone', enableSorting: false, cell: ({ row }) => row.original.phone || '—', meta: { className: 'font-mono text-text2' } },
                   {
+                    id: 'aadhaar',
                     header: 'Aadhaar',
-                    accessor: (r: any) => (r.aadhaar ? `XXXX-XXXX-${r.aadhaar.slice(-4)}` : '—'),
-                    className: 'font-mono text-text2',
+                    enableSorting: false,
+                    cell: ({ row }) => (row.original.aadhaar ? `XXXX-XXXX-${row.original.aadhaar.slice(-4)}` : '—'),
+                    meta: { className: 'font-mono text-text2' },
                   },
                   {
+                    id: 'status',
                     header: 'Status',
-                    accessor: (r: any) => (
-                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold ${r._ok ? 'bg-success/15 text-success' : 'bg-danger/15 text-danger'}`}>
-                        {r._ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
-                        {r._ok ? 'OK' : 'Error'}
+                    enableSorting: false,
+                    cell: ({ row }) => (
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold ${row.original._ok ? 'bg-success/15 text-success' : 'bg-danger/15 text-danger'}`}>
+                        {row.original._ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+                        {row.original._ok ? 'OK' : 'Error'}
                       </span>
                     ),
                   },
-                ]}
+                ] satisfies ColumnDef<any, any>[]}
               />
             </div>
 

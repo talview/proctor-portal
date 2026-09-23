@@ -10,6 +10,12 @@ export const PROCTOR_TYPE_LABELS: Record<ProctorType, string> = {
   Hybrid: 'Hybrid — In Office On Demand',
 };
 
+// Shared by ProctorsPage's paginated table search and proctorService.getAll's export
+// search -- one list so the two can't silently diverge on what's searchable (phone
+// was deliberately dropped from search; a second hand-copied list let export keep
+// searching it anyway until this was unified).
+export const PROCTOR_SEARCH_COLUMNS: string[] = ['name', 'email', 'pid'];
+
 export const INDIAN_STATES = [
   'Andhra Pradesh',
   'Arunachal Pradesh',
@@ -41,19 +47,21 @@ export const INDIAN_STATES = [
   'West Bengal',
 ];
 
+// Matches the "Proctor OS" reference artifact's own status color mapping (see
+// Badge.tsx, the actual rendered status pill, for the single source of truth).
 export const STATUS_COLORS = {
-  'In Progress': 'warning',
-  Verified: 'info',
+  'In Progress': 'info',
+  Verified: 'warning',
   Active: 'success',
-  Offboarded: 'danger',
+  Offboarded: 'neutral',
   Archived: 'secondary',
 } as const;
 
 export const STATUS_BADGES = {
-  'In Progress': 'bg-warning/15 text-warning',
-  Verified: 'bg-info/15 text-info',
+  'In Progress': 'bg-info/15 text-info',
+  Verified: 'bg-warning/15 text-warning',
   Active: 'bg-success/15 text-success',
-  Offboarded: 'bg-danger/15 text-danger',
+  Offboarded: 'bg-text3/15 text-text3',
   Archived: 'bg-text3/15 text-text3',
 } as const;
 

@@ -16,7 +16,7 @@ export function useAllProctorsLookup() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('proctors')
-        .select('id, name, email, managed_by, vendor, ptype');
+        .select('id, name, email, vendor, ptype');
       if (error) throw error;
       return data as Proctor[];
     },

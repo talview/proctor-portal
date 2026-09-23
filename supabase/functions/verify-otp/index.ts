@@ -123,7 +123,7 @@ serve(async (req) => {
           state: proctor.state || '',
           dob: proctor.dob || '',
           gender: proctor.gender || '',
-          managed_by: proctor.managed_by,
+          vendor: proctor.vendor,
           ptype: proctor.ptype,
         },
       }),

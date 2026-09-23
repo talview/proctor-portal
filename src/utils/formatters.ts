@@ -37,6 +37,16 @@ export function formatRelativeTime(date: string | Date | null | undefined): stri
 }
 
 /**
+ * Today's (or any Date's) calendar date as 'yyyy-MM-dd' in the browser's local
+ * timezone -- NOT `date.toISOString().slice(0, 10)`, which is UTC and runs a full
+ * calendar day behind local time for part of every day in IST (00:00-05:29 IST is
+ * still the previous UTC date), silently misdating "today" comparisons/records.
+ */
+export function localDateString(date: Date = new Date()): string {
+  return format(date, 'yyyy-MM-dd');
+}
+
+/**
  * Format phone number
  */
 export function formatPhone(phone: string | null | undefined): string {

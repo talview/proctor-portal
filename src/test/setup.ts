@@ -59,5 +59,17 @@ if (!URL.revokeObjectURL) {
   URL.revokeObjectURL = vi.fn();
 }
 
+// jsdom doesn't implement real navigation, so clicking an <a href="blob:...">
+// (the CSV export helpers' download trigger -- see exportToCSV/downloadCsv)
+// logs a noisy "Not implemented: navigation" error on every test run. That's
+// jsdom faithfully trying to follow a link, not a bug in the code under test
+// or in whichever test file happens to exercise it -- real browsers just
+// download the blob instead of navigating, so it's safe to no-op here.
+const originalAnchorClick = HTMLAnchorElement.prototype.click;
+HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+  if (this.href.startsWith('blob:') || this.href.startsWith('data:')) return;
+  originalAnchorClick.call(this);
+};
+
 // Suppress console.error for cleaner test output
 vi.spyOn(console, 'error').mockImplementation(() => {});

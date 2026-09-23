@@ -10,6 +10,20 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
+// The client-side check (OnboardingFormPage) is only a UX convenience -- this is the
+// actual gate, since this function is reachable directly regardless of what the form
+// itself validated.
+function calculateAge(dob: string): number {
+  const birthDate = new Date(dob)
+  const today = new Date()
+  let age = today.getFullYear() - birthDate.getFullYear()
+  const monthDiff = today.getMonth() - birthDate.getMonth()
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+    age--
+  }
+  return age
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -28,6 +42,9 @@ serve(async (req) => {
     if (!city || !city.trim()) throw new Error('City is required')
     if (!state) throw new Error('State is required')
     if (!dob) throw new Error('Date of birth is required')
+    const age = calculateAge(dob)
+    if (Number.isNaN(age)) throw new Error('Invalid date of birth')
+    if (age < 18) throw new Error('Must be at least 18 years old')
     if (!gender) throw new Error('Gender is required')
 
     const supabaseAdmin = createClient(

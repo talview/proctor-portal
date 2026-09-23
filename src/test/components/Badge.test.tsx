@@ -35,22 +35,22 @@ describe('Badge', () => {
     expect(span!.className).toContain('text-success');
   });
 
-  it('In Progress status renders with warning color class', () => {
+  it('In Progress status renders with info color class', () => {
     const { container } = render(<Badge status="In Progress" />);
     const span = container.querySelector('span');
-    expect(span!.className).toContain('text-warning');
+    expect(span!.className).toContain('text-info');
   });
 
-  it('Offboarded status renders with danger color class', () => {
+  it('Offboarded status renders with a neutral (text3) color class', () => {
     const { container } = render(<Badge status="Offboarded" />);
     const span = container.querySelector('span');
-    expect(span!.className).toContain('text-danger');
+    expect(span!.className).toContain('text-text3');
   });
 
-  it('Verified status renders with info color class', () => {
+  it('Verified status renders with warning color class', () => {
     const { container } = render(<Badge status="Verified" />);
     const span = container.querySelector('span');
-    expect(span!.className).toContain('text-info');
+    expect(span!.className).toContain('text-warning');
   });
 
   it('renders a dot indicator element inside the badge', () => {

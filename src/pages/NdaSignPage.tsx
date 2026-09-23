@@ -8,16 +8,24 @@ import {
   CheckCircle2,
   RefreshCw,
   PartyPopper,
-  FileText,
   Upload,
   Eraser,
   PenLine,
   Type as TypeIcon,
+  FileText,
+  Image as ImageIcon,
+  GraduationCap,
+  Fingerprint,
+  CreditCard,
+  Glasses,
+  Eye,
+  Trash2,
 } from 'lucide-react';
 import Input from '@/components/ui/Input';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
 import { invokeEdgeFunction } from '@/services/supabase';
+import { useCooldown, parseCooldownSeconds } from '@/hooks/useCooldown';
 import {
   DOCUMENT_FORMAT_HINT,
   computeFileSha256Hex,
@@ -25,6 +33,9 @@ import {
   prepareDocumentFile,
   uploadFileWithProgress,
 } from '@/utils/documentUpload';
+import PublicPortalFrame from '@/components/public/PublicPortalFrame';
+
+const NDA_STEPS = [{ label: 'Authentication' }, { label: 'NDA Signature' }, { label: 'Document Uploads' }];
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -51,13 +62,16 @@ const DOC_LABELS: Record<string, string> = {
   pan_copy: 'PAN Copy',
   eye_test: 'Eye Test Report',
 };
-const DOC_INSTRUCTIONS: Record<string, string> = {
-  resume: 'Your most recent resume/CV.',
-  passport_photo: 'A recent passport-size photo of yourself.',
-  grad_cert: 'Your graduation or highest-qualification certificate.',
-  aadhaar_copy: 'A clear copy of your Aadhaar card, both sides if needed.',
-  pan_copy: 'A clear copy of your PAN card.',
-  eye_test: 'A recent eye test / vision report.',
+// One distinct icon per document, standing in for the instructional sentence this
+// used to carry (e.g. "A clear copy of your Aadhaar card...") -- the label plus a
+// recognizable icon carries the same meaning without the extra reading.
+const DOC_ICONS: Record<string, typeof FileText> = {
+  resume: FileText,
+  passport_photo: ImageIcon,
+  grad_cert: GraduationCap,
+  aadhaar_copy: Fingerprint,
+  pan_copy: CreditCard,
+  eye_test: Glasses,
 };
 const DOC_ORDER = ['resume', 'passport_photo', 'grad_cert', 'aadhaar_copy', 'pan_copy', 'eye_test'];
 // At most this many documents upload concurrently -- independent per-kind state below
@@ -100,6 +114,10 @@ export default function NdaSignPage() {
   const [loading, setLoading] = useState(false);
   const [maskedEmail, setMaskedEmail] = useState('');
   const [otp, setOtp] = useState('');
+  // Mirrors the server's 30s resend cooldown (nda-session-send-otp) so it's visible
+  // up front -- a disabled, counting-down button -- instead of the signer only
+  // discovering it exists when a click comes back rejected.
+  const resendCooldown = useCooldown();
   const [stepToken, setStepToken] = useState('');
   const [signerName, setSignerName] = useState('');
   const [fieldMap, setFieldMap] = useState<TemplateField[]>([]);
@@ -108,6 +126,17 @@ export default function NdaSignPage() {
   const [uploadedDocs, setUploadedDocs] = useState<
     { docKind: string; fileName: string; byteSize: number; integrityStatus?: 'pending' | 'verified' | 'mismatch' }[]
   >([]);
+  // Mirrors nda-session-status's pdfJobStatus/pdfJobError -- whichever job
+  // (sign_render while 'signing', finalize_certificate while 'signed') is currently
+  // relevant, so both the Upload step and the Finalize poll can show real progress
+  // ("Preparing signed document"/"Finalizing") and a genuine terminal failure instead
+  // of only discovering a stuck render when the signer clicks Submit.
+  const [pdfJobStatus, setPdfJobStatus] = useState<string | undefined>(undefined);
+  const [pdfJobError, setPdfJobError] = useState<string | null>(null);
+  // Raw backend status, distinct from the derived `step` -- both 'signing' and
+  // 'signed' map to the same 'upload' step, but the progress copy needs to tell them
+  // apart (sign_render vs finalize_certificate is whichever job pdfJobStatus reflects).
+  const [sessionStatus, setSessionStatus] = useState('');
   // Only ever holds an entry for a doc actively uploading (with byte progress) or one
   // that just failed client-side/in-flight -- once a doc is confirmed, its state lives
   // in `uploadedDocs` (from the server) instead, so this is cleared for that kind.
@@ -161,6 +190,9 @@ export default function NdaSignPage() {
 
       setSignerName(data.signerName || '');
       setUploadedDocs(data.uploadedDocs || []);
+      setPdfJobStatus(data.pdfJobStatus);
+      setPdfJobError(data.pdfJobError || null);
+      setSessionStatus(data.status || '');
 
       if (data.status === 'expired') {
         setStep('error');
@@ -177,6 +209,18 @@ export default function NdaSignPage() {
 
       if (data.status === 'completed') {
         setStep(existingStepToken && data.stepTokenValid ? 'success' : 'already_done');
+      } else if (data.status === 'signing' && !data.pdfJobStatus) {
+        // No sign_render job exists for a session already flagged 'signing' --
+        // the prior sign attempt was interrupted before the durable job ever got
+        // created (see nda-session-submit's handleSign), not a transient timing
+        // gap: the job upsert is synchronous within that same call, so if it had
+        // succeeded the job would already exist by the time this status check
+        // runs. Routing to 'upload' here (like a healthy 'signing' session) would
+        // leave the signer stuck polling forever with nothing to show for it --
+        // back to 'sign' instead, where submitting again hits handleSign's own
+        // recovery path for exactly this state.
+        setError('We ran into a problem finishing your last submission. Please review and sign again.');
+        setStep(existingStepToken && data.stepTokenValid ? 'sign' : 'send_code');
       } else if (data.status === 'signed' || data.status === 'signing') {
         // 'signing' means the signed PDF is still rendering in the background --
         // uploads are already open against it (see nda-session-upload-url), so this
@@ -203,7 +247,13 @@ export default function NdaSignPage() {
       const data = await invokeEdgeFunction<any>('nda-session-send-otp', { token });
       setMaskedEmail(data.maskedEmail);
       setStep('otp');
+      resendCooldown.start(30);
     } catch (err: any) {
+      // A rejected send still tells us exactly how long is left -- re-sync the
+      // visible countdown to it rather than leaving a stale/finished timer next to
+      // a "please wait" error.
+      const secondsLeft = parseCooldownSeconds(err.message || '');
+      if (secondsLeft) resendCooldown.start(secondsLeft);
       setError(err.message || 'Failed to send code');
     } finally {
       setLoading(false);
@@ -311,25 +361,42 @@ export default function NdaSignPage() {
     }
   };
 
-  // Background poll while any document is awaiting server-side verification --
-  // deliberately its own lightweight call rather than reusing refreshStatus, which
-  // toggles the page-wide `loading` flag (used to disable Submit) and would make it
-  // flicker every tick.
+  // Background poll while any document is awaiting server-side verification, or the
+  // sign_render job is still preparing the signed document -- deliberately its own
+  // lightweight call rather than reusing refreshStatus, which toggles the page-wide
+  // `loading` flag (used to disable Submit) and would make it flicker every tick.
+  // This is what lets the Upload step show real "Preparing signed document"/"Verifying
+  // uploads" progress (and a real failure) even before the signer ever clicks Submit,
+  // instead of only discovering a stuck render at Finalize time.
+  const pdfJobInFlight = pdfJobStatus === 'queued' || pdfJobStatus === 'processing' || pdfJobStatus === 'retrying';
   useEffect(() => {
     if (!stepToken) return;
     const hasPending = uploadedDocs.some((d) => d.integrityStatus === 'pending');
-    if (!hasPending) return;
+    if (!hasPending && !pdfJobInFlight) return;
     const interval = setInterval(async () => {
       try {
         const data = await invokeEdgeFunction<any>('nda-session-status', { stepToken });
         if (data?.uploadedDocs) setUploadedDocs(data.uploadedDocs);
+        setPdfJobStatus(data?.pdfJobStatus);
+        setPdfJobError(data?.pdfJobError || null);
       } catch {
         // best-effort -- a transient failure just gets picked up on the next tick
       }
     }, 1500);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uploadedDocs, stepToken]);
+  }, [uploadedDocs, stepToken, pdfJobInFlight]);
+
+  // Progress copy for the Upload step, driven entirely off state already being polled
+  // above -- "Signature saved" (job not queued/known yet) -> "Preparing signed
+  // document" (sign_render in flight) -> "Verifying uploads" (a doc still pending) ->
+  // "Finalizing" (finalize_certificate in flight, i.e. after Submit) -> "Completed".
+  const uploadProgressLabel = (() => {
+    if (pdfJobStatus === 'failed') return null; // shown as a distinct failure state instead
+    if (pdfJobInFlight) return sessionStatus === 'signing' ? 'Preparing your signed document…' : 'Finalizing your submission…';
+    if (uploadedDocs.some((d) => d.integrityStatus === 'pending')) return 'Verifying uploads…';
+    return null;
+  })();
 
   const handleDocRemove = async (docKind: string) => {
     setError('');
@@ -359,45 +426,119 @@ export default function NdaSignPage() {
     }
   };
 
-  const [finalizing, setFinalizing] = useState<'idle' | 'submitting' | 'finishing'>('idle');
+  const [finalizing, setFinalizing] = useState<'idle' | 'polling'>('idle');
+  // A genuine terminal state (the finalize_certificate job hit max_attempts, or we've
+  // been waiting past the ceiling below) -- distinct from the ordinary "still working,
+  // keep waiting" case, which never surfaces anything to the signer at all.
+  const [finalizeFailure, setFinalizeFailure] = useState<string | null>(null);
+  const finalizePollIdRef = useRef(0);
 
-  const handleFinalize = async (attempt = 0) => {
+  // Durability now lives in the job table (see nda-session-submit), not in holding
+  // this request open or in a client-side retry loop racing the worker -- this polls
+  // at the cadence a background job actually completes on: fast at first (2s, since
+  // most jobs finish in seconds), then backing off to 5s past 30s, up to a few
+  // minutes before treating it as a real stall rather than hammering the backend
+  // forever. Each tick reads status first (cheap, and lets a genuine terminal failure
+  // stop the loop before ever calling finalize again) and only then nudges finalize --
+  // which is idempotent: it no-ops while a job is already in flight and only ever
+  // queues a fresh one when none exists or the prior attempt is terminally failed.
+  const handleFinalize = async () => {
     setLoading(true);
     setError('');
-    setFinalizing(attempt === 0 ? 'submitting' : 'finishing');
-    try {
-      const data = await invokeEdgeFunction<any>('nda-session-submit', { action: 'finalize', stepToken });
-      // Rare: the signer finished uploading documents faster than the background
-      // signed-PDF render. The server already polled briefly and came up empty --
-      // wait a moment and try again rather than surfacing this as an error.
-      if (data?.stillProcessing) {
-        if (attempt >= 5) {
-          throw new Error('Still finishing up your signed document. Please wait a moment and press Submit again.');
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        return handleFinalize(attempt + 1);
-      }
-      setStep('success');
-    } catch (err: any) {
-      setError(err.message || 'Failed to submit');
-    } finally {
+    setFinalizeFailure(null);
+    setFinalizing('polling');
+    const pollId = ++finalizePollIdRef.current;
+    const startedAt = Date.now();
+    const FAST_POLL_MS = 2000;
+    const SLOW_POLL_MS = 5000;
+    const FAST_POLL_WINDOW_MS = 30_000;
+    const CEILING_MS = 4 * 60_000;
+
+    const stop = (fn: () => void) => {
+      if (finalizePollIdRef.current !== pollId) return; // superseded by a newer call
+      fn();
       setLoading(false);
       setFinalizing('idle');
-    }
+    };
+
+    const tick = async (): Promise<void> => {
+      if (finalizePollIdRef.current !== pollId) return;
+
+      try {
+        const status = await invokeEdgeFunction<any>('nda-session-status', { stepToken });
+        if (status?.status === 'completed') return stop(() => setStep('success'));
+        if (status?.pdfJobStatus === 'failed') {
+          return stop(() =>
+            setFinalizeFailure(
+              status.pdfJobError || 'Something went wrong finishing your submission. Please contact your coordinator.'
+            )
+          );
+        }
+        setPdfJobStatus(status?.pdfJobStatus);
+        setPdfJobError(status?.pdfJobError || null);
+        setSessionStatus(status?.status || '');
+      } catch {
+        // best-effort -- a transient status read never stops the loop on its own
+      }
+
+      if (Date.now() - startedAt >= CEILING_MS) {
+        return stop(() =>
+          setFinalizeFailure('Still processing your submission. Please check back shortly, or contact your coordinator if this persists.')
+        );
+      }
+
+      try {
+        const data = await invokeEdgeFunction<any>('nda-session-submit', { action: 'finalize', stepToken });
+        if (!data?.stillProcessing) return stop(() => setStep('success'));
+      } catch (err: any) {
+        // A genuine synchronous validation error (missing/mismatched documents) --
+        // surface it immediately rather than continuing to poll.
+        return stop(() => setError(err.message || 'Failed to submit'));
+      }
+
+      if (finalizePollIdRef.current !== pollId) return;
+      const elapsed = Date.now() - startedAt;
+      await new Promise((resolve) => setTimeout(resolve, elapsed < FAST_POLL_WINDOW_MS ? FAST_POLL_MS : SLOW_POLL_MS));
+      return tick();
+    };
+
+    await tick();
   };
 
   const allDocsUploaded = DOC_ORDER.every((k) => uploadedDocKinds.includes(k));
-  const isWideStep = step === 'sign';
+
+  const stepIndex =
+    step === 'send_code' || step === 'otp' ? 0 : step === 'sign' ? 1 : step === 'upload' ? 2 : step === 'success' ? 3 : -1;
+  const baseHeading =
+    step === 'send_code'
+      ? 'Verify your identity'
+      : step === 'otp'
+        ? 'Enter your code'
+        : step === 'sign'
+          ? 'Review & sign'
+          : step === 'upload'
+            ? 'Upload your documents'
+            : 'All done';
+  const baseSubtitle =
+    step === 'send_code'
+      ? "We'll send a one-time code before you can review and sign."
+      : step === 'otp'
+        ? 'Check your email for the 6-digit verification code.'
+        : step === 'sign'
+          ? 'Read the agreement and complete every required field.'
+          : step === 'upload'
+            ? 'A few supporting documents to finish onboarding.'
+            : 'Your documents have been signed and submitted.';
 
   return (
-    <div className="min-h-screen bg-bg flex items-center justify-center p-6">
-      <div className={`bg-surface border border-border rounded-2xl w-full overflow-hidden ${isWideStep ? 'max-w-4xl' : 'max-w-2xl'}`}>
-        <div className="bg-gradient-to-r from-accent to-accent5 p-5 sm:p-8 text-center">
-          <FileText className="w-10 h-10 text-white mx-auto mb-3" />
-          <h1 className="text-2xl font-bold text-white mb-2">Onboarding Documents</h1>
-          {signerName && <p className="text-white/80 text-sm">{signerName}</p>}
-        </div>
-
+    <PublicPortalFrame
+      title="NDA Signing"
+      heading={baseHeading}
+      subtitle={signerName ? `${signerName} · ${baseSubtitle}` : baseSubtitle}
+      steps={NDA_STEPS}
+      currentStepIndex={stepIndex}
+      wide={step === 'sign'}
+    >
         <div className={step === 'sign' ? '' : 'p-8'}>
           {error && (
             <div className={`bg-danger/10 border border-danger/30 rounded-lg p-4 text-danger text-sm ${step === 'sign' ? 'm-4' : 'mb-6'}`}>
@@ -466,8 +607,9 @@ export default function NdaSignPage() {
                 <Button type="submit" variant="primary" className="flex-1" disabled={loading || otp.length !== 6}>
                   {loading ? 'Verifying...' : <><CheckCircle2 className="w-4 h-4" /> Verify</>}
                 </Button>
-                <Button type="button" variant="ghost" onClick={handleSendCode} disabled={loading}>
-                  <RefreshCw className="w-4 h-4" /> Resend
+                <Button type="button" variant="ghost" onClick={handleSendCode} disabled={loading || resendCooldown.remaining > 0}>
+                  <RefreshCw className="w-4 h-4" />
+                  {resendCooldown.remaining > 0 ? `Resend in ${resendCooldown.remaining}s` : 'Resend'}
                 </Button>
               </div>
             </form>
@@ -490,7 +632,12 @@ export default function NdaSignPage() {
               <p className="text-text2 text-sm mb-6 text-center">
                 Your documents have been signed. Please upload each of the following to finish.
               </p>
-              <div className="space-y-3 mb-6">
+              {pdfJobStatus === 'failed' && (
+                <div className="bg-danger/10 border border-danger/30 rounded-lg p-4 text-danger text-sm mb-6 text-center">
+                  {pdfJobError || 'We ran into a problem preparing your signed document.'} Please contact your coordinator.
+                </div>
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
                 {DOC_ORDER.map((kind) => {
                   const serverDoc = uploadedDocs.find((d) => d.docKind === kind);
                   const localState = uploadStates[kind];
@@ -522,12 +669,28 @@ export default function NdaSignPage() {
                     onFileChosen(e.dataTransfer.files?.[0]);
                   };
 
+                  const DocIcon = DOC_ICONS[kind];
+                  // The verified state especially needs to read at a glance across a
+                  // grid of 6 cards -- a tinted surface + border does that far better
+                  // than the small "Verified" badge alone. A hard failure gets the
+                  // same treatment in the danger color so it's equally scannable.
+                  const cardStateClass =
+                    status === 'verified'
+                      ? 'border-success/40 bg-success/5'
+                      : status === 'failed'
+                        ? 'border-danger/40 bg-danger/5'
+                        : 'border-border2 bg-surface2 shadow-sm';
+
                   return (
-                    <div key={kind} className="rounded-lg border border-border bg-surface2 p-3.5">
-                      <div className="flex items-start justify-between gap-3 mb-1.5">
-                        <div>
+                    // Fixed height regardless of state (drop-zone vs. filename row vs. an
+                    // error line appearing/disappearing) -- the bottom content block is
+                    // anchored to the bottom and clips instead of growing the card, so a
+                    // 6-card grid never reflows as files are added/removed/fail.
+                    <div key={kind} className={`rounded-lg border p-3.5 transition-colors h-[140px] flex flex-col ${cardStateClass}`}>
+                      <div className="flex items-start justify-between gap-3 mb-2 flex-shrink-0">
+                        <div className="flex items-center gap-2">
+                          <DocIcon className="w-4 h-4 text-text3 flex-shrink-0" />
                           <div className="text-sm font-semibold text-text">{DOC_LABELS[kind]}</div>
-                          <div className="text-[11px] text-text3">{DOC_INSTRUCTIONS[kind]}</div>
                         </div>
                         {status === 'verified' && (
                           <span className="inline-flex items-center gap-1 text-success text-xs font-semibold flex-shrink-0">
@@ -550,10 +713,11 @@ export default function NdaSignPage() {
                           </span>
                         )}
                       </div>
-                      <div className="text-[10px] text-text3 mb-2">{DOCUMENT_FORMAT_HINT}</div>
+                      <div className="text-[10px] text-text3 mb-2 flex-shrink-0">{DOCUMENT_FORMAT_HINT}</div>
 
+                      <div className="flex-1 min-h-0 flex flex-col justify-end gap-1.5 overflow-hidden">
                       {localState?.error && (
-                        <div className="text-[11px] text-danger mb-2">{localState.error}</div>
+                        <div className="text-[11px] text-danger truncate" title={localState.error}>{localState.error}</div>
                       )}
 
                       {status === 'verifying' || status === 'verified' || (status === 'failed' && serverDoc) ? (
@@ -565,16 +729,22 @@ export default function NdaSignPage() {
                               </>
                             )}
                           </span>
-                          <div className="flex items-center gap-2 flex-shrink-0">
+                          <div className="flex items-center gap-1.5 flex-shrink-0">
                             <button
-                              className="text-xs font-semibold text-accent hover:underline disabled:opacity-50"
+                              className="p-1.5 rounded text-text2 hover:text-accent hover:bg-accent/10 disabled:opacity-40"
                               disabled={!canReplaceOrRemove}
                               onClick={() => handleDocPreview(kind)}
+                              title="Preview"
+                              aria-label="Preview"
                             >
-                              Preview
+                              <Eye className="w-3.5 h-3.5" />
                             </button>
-                            <label className="text-xs font-semibold text-accent cursor-pointer hover:underline">
-                              Replace
+                            <label
+                              className="p-1.5 rounded text-text2 hover:text-accent hover:bg-accent/10 cursor-pointer"
+                              title="Replace"
+                              aria-label="Replace"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
                               <input
                                 type="file"
                                 accept=".pdf,.jpg,.jpeg,.png"
@@ -587,11 +757,13 @@ export default function NdaSignPage() {
                               />
                             </label>
                             <button
-                              className="text-xs font-semibold text-danger hover:underline disabled:opacity-50"
+                              className="p-1.5 rounded text-text2 hover:text-danger hover:bg-danger/10 disabled:opacity-40"
                               disabled={!canReplaceOrRemove}
                               onClick={() => handleDocRemove(kind)}
+                              title={isRemoving ? 'Removing…' : 'Remove'}
+                              aria-label="Remove"
                             >
-                              {isRemoving ? 'Removing...' : 'Remove'}
+                              {isRemoving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
                             </button>
                           </div>
                         </div>
@@ -599,18 +771,18 @@ export default function NdaSignPage() {
                         <label
                           onDragOver={(e) => e.preventDefault()}
                           onDrop={onDrop}
+                          title={status === 'uploading' ? `Uploading ${localState?.progress ?? 0}%` : status === 'failed' ? 'Retry upload' : 'Drop file here or click to browse'}
+                          aria-label={status === 'uploading' ? `Uploading ${localState?.progress ?? 0}%` : status === 'failed' ? 'Retry upload' : 'Drop file here or click to browse'}
                           className="flex items-center justify-center gap-1.5 text-xs font-semibold text-accent cursor-pointer border border-dashed border-accent/50 rounded-md py-2 hover:bg-accent/5"
                         >
                           {status === 'uploading' ? (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <Loader2 className="w-4 h-4 animate-spin" />
                           ) : (
-                            <Upload className="w-3.5 h-3.5" />
+                            <Upload className="w-4 h-4" />
                           )}
-                          {status === 'uploading'
-                            ? `Uploading ${localState?.progress ?? 0}%`
-                            : status === 'failed'
-                              ? 'Retry upload'
-                              : 'Drop file here or click to browse'}
+                          {status === 'uploading' && (
+                            <span className="text-[10px]">{localState?.progress ?? 0}%</span>
+                          )}
                           <input
                             type="file"
                             accept=".pdf,.jpg,.jpeg,.png"
@@ -623,13 +795,32 @@ export default function NdaSignPage() {
                           />
                         </label>
                       )}
+                      </div>
                     </div>
                   );
                 })}
               </div>
-              <Button variant="success" className="w-full" onClick={() => handleFinalize()} disabled={!allDocsUploaded || loading}>
-                {finalizing === 'finishing' ? 'Finishing up your signed document…' : loading ? 'Submitting...' : <><CheckCircle2 className="w-4 h-4" /> Submit All Documents</>}
-              </Button>
+              {finalizeFailure ? (
+                <div className="rounded-lg border border-danger/30 bg-danger/10 p-4 text-center">
+                  <XCircle className="w-8 h-8 text-danger mx-auto mb-2" />
+                  <p className="text-sm text-danger mb-3">{finalizeFailure}</p>
+                  <Button variant="primary" onClick={() => handleFinalize()} disabled={loading}>
+                    <RefreshCw className="w-4 h-4" /> Try again
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  {(finalizing === 'polling' ? (sessionStatus === 'signed' ? 'Finalizing your submission…' : uploadProgressLabel) : uploadProgressLabel) && (
+                    <p className="text-xs text-text3 text-center mb-2 flex items-center justify-center gap-1.5">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      {finalizing === 'polling' ? 'Finalizing your submission…' : uploadProgressLabel}
+                    </p>
+                  )}
+                  <Button variant="success" className="w-full" onClick={() => handleFinalize()} disabled={!allDocsUploaded || loading}>
+                    {finalizing === 'polling' ? 'Finalizing…' : loading ? 'Submitting...' : <><CheckCircle2 className="w-4 h-4" /> Submit All Documents</>}
+                  </Button>
+                </>
+              )}
             </div>
           )}
 
@@ -646,8 +837,7 @@ export default function NdaSignPage() {
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </PublicPortalFrame>
   );
 }
 
@@ -696,7 +886,6 @@ function SignDocumentStep({
   const slotRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const pagePlaceholderRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const renderingRef = useRef<Set<number>>(new Set());
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const todayDisplay = useMemo(() => formatIstDateDisplay(new Date()), []);
 
   // Loading the document itself (parsing structure) is fast -- it's rendering every
@@ -742,7 +931,12 @@ function SignDocumentStep({
           }
         }
       },
-      { root: scrollContainerRef.current, rootMargin: '800px 0px', threshold: 0.01 }
+      // root:null (the viewport) -- the actual scrolling ancestor is now
+      // PublicPortalFrame's content pane (this step no longer owns its own
+      // scroll region), which this component has no ref to. The frame fills
+      // nearly the full viewport, so viewport-relative intersection is an
+      // accurate enough proxy.
+      { root: null, rootMargin: '800px 0px', threshold: 0.01 }
     );
     Object.values(pagePlaceholderRefs.current).forEach((el) => el && observer.observe(el));
     return () => observer.disconnect();
@@ -857,7 +1051,7 @@ function SignDocumentStep({
         </div>
       )}
 
-      <div ref={scrollContainerRef} className="max-h-[65vh] overflow-y-auto p-5 bg-surface2">
+      <div className="p-5 bg-surface2">
         {!pdfDoc ? (
           <div className="text-center py-12 text-text3 text-sm flex flex-col items-center gap-2">
             <Loader2 className="w-6 h-6 animate-spin" /> Loading document ({pageCount} page{pageCount === 1 ? '' : 's'})...
@@ -896,7 +1090,7 @@ function SignDocumentStep({
                       <div
                         key={f.field_key}
                         style={style}
-                        className="flex items-center px-1 bg-accent/5 border border-accent/30 rounded-sm text-[11px] text-text2 font-medium overflow-hidden whitespace-nowrap"
+                        className="flex items-center px-1 bg-accent/5 border border-accent/30 rounded-sm text-[11px] text-slate-700 font-medium overflow-hidden whitespace-nowrap"
                       >
                         {f.kind === 'full_name' ? signerName : todayDisplay}
                       </div>
@@ -959,7 +1153,7 @@ function SignDocumentStep({
                           value={textValues[f.label] || ''}
                           onChange={(e) => setTextValues((v) => ({ ...v, [f.label!]: e.target.value }))}
                           placeholder={f.label}
-                          className="w-full h-full px-1 text-[11px] bg-white border border-accent rounded-sm outline-none focus:ring-1 focus:ring-accent"
+                          className="w-full h-full px-1 text-[11px] bg-white text-slate-900 placeholder:text-slate-400 border border-accent rounded-sm outline-none focus:ring-1 focus:ring-accent"
                         />
                       </div>
                     );
@@ -1192,7 +1386,9 @@ function SignatureModal({
               className="border border-border rounded-lg bg-white h-[160px] flex items-center justify-center mb-2 px-4"
               style={{ fontFamily: SIGNATURE_FONTS[fontIndex] }}
             >
-              <span className="text-4xl text-text truncate max-w-full">{typedName.trim() || 'Your Name'}</span>
+              <span className={`text-4xl truncate max-w-full ${typedName.trim() ? 'text-slate-900' : 'text-slate-400'}`}>
+                {typedName.trim() || 'Your Name'}
+              </span>
             </div>
             <div className="flex justify-end mb-4">
               <Button variant="ghost" size="sm" onClick={() => setFontIndex((i) => (i + 1) % SIGNATURE_FONTS.length)}>

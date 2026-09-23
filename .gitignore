@@ -34,3 +34,11 @@ supabase/.branches
 *.njsproj
 *.sln
 *.sw?
+
+# Claude Code's own local project/session state -- not app code
+.claude/
+
+# One-off local artifacts produced during a working session, not part of the app
+Proctor-Portal-200-Concurrency-Production-Recommendation.docx
+proctor-portal-ux-workbench-preview.html
+premium-login-preview.html

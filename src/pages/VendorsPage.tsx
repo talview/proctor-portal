@@ -6,10 +6,12 @@ import { useAuthStore } from '@/stores/auth';
 import Input from '@/components/ui/Input';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import FormSection from '@/components/ui/FormSection';
 import { logAudit } from '@/services/audit';
 import { showConfirm, showAlert } from '@/components/ui/GlobalDialog';
+import { runWithConcurrency } from '@/utils/concurrency';
 
 interface Vendor {
   id: string;
@@ -120,14 +122,19 @@ export default function VendorsPage() {
       </div>
 
       {/* Vendor List */}
-      <Table
+      <DataTable
           data={vendors}
           isLoading={isLoading}
+          onRowClick={handleEditVendor}
           emptyMessage="No vendors found. Click + Add Vendor to get started."
           columns={[
             {
+              id: 'vendor',
               header: 'Vendor',
-              accessor: (vendor) => (
+              enableSorting: false,
+              cell: ({ row }) => {
+                const vendor = row.original;
+                return (
                 <div className="flex flex-col gap-1">
                   <div className="font-semibold text-text">{vendor.name}</div>
                   <div className="flex items-center gap-2 flex-wrap">
@@ -143,11 +150,15 @@ export default function VendorsPage() {
                     </span>
                   </div>
                 </div>
-              ),
+                );
+              },
             },
             {
+              id: 'contacts',
               header: 'Contacts',
-              accessor: (vendor) => {
+              enableSorting: false,
+              cell: ({ row }) => {
+                const vendor = row.original;
                 const vendorContacts = contacts.filter((c) => c.vendor_id === vendor.id);
 
                 if (vendorContacts.length === 0) {
@@ -176,6 +187,7 @@ export default function VendorsPage() {
                               {contact.email && (
                                 <a
                                   href={`mailto:${contact.email}`}
+                                  onClick={(e) => e.stopPropagation()}
                                   className="hover:text-accent"
                                 >
                                   {contact.email}
@@ -185,7 +197,7 @@ export default function VendorsPage() {
                             </div>
                           </div>
                           <button
-                            onClick={() => handleDeleteContact(contact.id)}
+                            onClick={(e) => { e.stopPropagation(); handleDeleteContact(contact.id); }}
                             className="shrink-0 text-[11px] text-danger hover:underline px-1 py-0.5"
                           >
                             Remove
@@ -198,15 +210,17 @@ export default function VendorsPage() {
               },
             },
             {
+              id: 'actions',
               header: 'Actions',
-              className: 'w-28',
-              accessor: (vendor) => (
-                <Button variant="ghost" size="sm" onClick={() => handleEditVendor(vendor)}>
+              enableSorting: false,
+              meta: { className: 'w-28' },
+              cell: ({ row }) => (
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); handleEditVendor(row.original); }}>
                   Edit
                 </Button>
               ),
             },
-          ]}
+          ] satisfies ColumnDef<Vendor, any>[]}
         />
 
       {/* Add/Edit Modal */}
@@ -430,14 +444,15 @@ function VendorModal({
         });
       }
 
-      // Delete removed contacts
+      // Delete removed contacts -- bounded concurrency instead of one-at-a-time,
+      // matching the pattern used everywhere else in the app (see runWithConcurrency).
       const toDelete = pocs.filter((p) => p._del && p.id);
-      for (const p of toDelete) {
+      await runWithConcurrency(toDelete, 4, async (p) => {
         await supabase.from('vendor_contacts').delete().eq('id', p.id);
-      }
+      });
 
       // Save active contacts
-      for (const poc of activePOCs) {
+      await runWithConcurrency(activePOCs, 4, async (poc) => {
         if (poc._new || !poc.id) {
           // Insert new
           await supabase.from('vendor_contacts').insert({
@@ -462,7 +477,7 @@ function VendorModal({
             })
             .eq('id', poc.id);
         }
-      }
+      });
     },
     onSuccess: () => {
       showAlert(vendor ? 'Updated successfully' : 'Added successfully', { tone: 'success' });

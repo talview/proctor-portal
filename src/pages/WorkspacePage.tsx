@@ -1,1240 +1,355 @@
-import { useRef, useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Calendar, ClipboardList, StickyNote, PartyPopper, AlertTriangle, FileEdit, Lock, Pencil, Trash2, Save, Users, Download, Upload } from 'lucide-react';
+import { Calendar, StickyNote, Pencil, Trash2, Save, Plus, ListChecks, ChevronDown } from 'lucide-react';
 import { supabase } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
 import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
-import Select from '@/components/ui/Select';
 import Modal from '@/components/ui/Modal';
-import { logAudit } from '@/services/audit';
-import { PROCTOR_TYPES, EVAL_REASON_OPTIONS_BY_RESULT } from '@/utils/constants';
-import { useManagedByOptions } from '@/hooks/useManagedByOptions';
 import { showAlert } from '@/components/ui/GlobalDialog';
-import ClearFiltersButton from '@/components/ui/ClearFiltersButton';
-import UnderlineTabs from '@/components/ui/UnderlineTabs';
-import Table from '@/components/ui/Table';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import EmptyState from '@/components/ui/EmptyState';
-import { useAllProctorsLookup } from '@/hooks/useAllProctorsLookup';
-import { usePaginatedQuery } from '@/hooks/usePaginatedQuery';
-import { useGroupEvaluationActions } from '@/hooks/useGroupEvaluationActions';
-import { runWithConcurrency } from '@/utils/concurrency';
-import type { Evaluation, Note, Proctor, ScheduledEventFilters } from '@/types';
+import Avatar from '@/components/ui/Avatar';
+import { useUpcomingReminders, reminderTitle, reminderDescription, reminderBadge, type ReminderItem } from '@/hooks/useUpcomingReminders';
+import { localDateString } from '@/utils/formatters';
+import type { Note } from '@/types';
 
-/** Buckets evaluation rows by group_id -- a Multi Assign batch shares one group_id
- * across every candidate (see EvaluationsPage's BulkAssessment), so this recovers
- * those batches as one unit. A row with no group_id (or one no sibling shares) falls
- * back to its own row id as the key, so it renders as a plain single-candidate group
- * -- individually-scheduled rows are completely unaffected by this. */
-function groupByGroupId<T extends { id: string; group_id?: string | null }>(items: T[]): T[][] {
-  const map = new Map<string, T[]>();
-  for (const item of items) {
-    const key = item.group_id || item.id;
-    const bucket = map.get(key);
-    if (bucket) bucket.push(item);
-    else map.set(key, [item]);
-  }
-  return Array.from(map.values());
+// Same react-query key NotesPanel's own notes query uses -- reusing it here (rather
+// than a second, differently-keyed query) means react-query dedupes the two into
+// one request/cache entry instead of fetching the same rows twice.
+const NOTES_QUERY_KEY = (userId: string | undefined) => ['user-notes', userId];
+
+/** Shared by both PriorityTasksSection and NotesPanel: while a stack is
+ * expanded, a click anywhere outside the panel collapses it back, same as a
+ * dropdown/popover -- not just the explicit "Collapse" link in the header. */
+function useCollapseOnOutsideClick(active: boolean, onCollapse: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!active) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onCollapse();
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [active, onCollapse]);
+  return ref;
 }
 
+/** Time-of-day greeting -- computed locally off the browser clock, same pattern
+ * Topbar's own clock already uses (no shared "current time" hook exists to reuse). */
+function greetingFor(date: Date): string {
+  const hour = date.getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
+/** Same route split the sidebar/CommandPalette already use for this page -- admin's
+ * Proctors table lives at /proctors, coordinator lands on /my-proctors. Duplicated
+ * here rather than imported (it's a one-line lookup, not shared internals worth a
+ * cross-module dependency). */
+function proctorsPathFor(role: string | undefined) {
+  return role === 'admin' ? '/proctors' : '/my-proctors';
+}
+
+/** Purely a reminder space: a read-only glance at what's scheduled (no Evaluate
+ * action -- that workflow now lives on its own page, Scheduled Events, under
+ * Certification) plus personal notes. The full schedule board itself lives
+ * only on Scheduled Events now -- this page used to also render a read-only
+ * copy of it below Upcoming Tasks, which was pure duplication (identical data,
+ * identical component, just without the evaluate actions); Upcoming Tasks
+ * already surfaces the handful that matter most, and "+N more" links straight
+ * to Scheduled Events for everything else.
+ *
+ * The page itself is a non-scrolling shell -- h-full resolves against
+ * MainLayout's now properly height-bounded content area (see its own comment),
+ * not a guessed pixel value -- both panels below scroll independently inside
+ * their own bounded height instead of growing the document, so neither a long
+ * task list nor a long note list ever pushes the other off-screen or requires
+ * scrolling past one to reach the other. */
 export default function WorkspacePage() {
   const { user } = useAuthStore();
-  const [activeTab, setActiveTab] = useState(0);
-  const [evaluationToReview, setEvaluationToReview] = useState<any | null>(null);
-  const [groupToEvaluate, setGroupToEvaluate] = useState<Evaluation[] | null>(null);
 
   // Vendor can't reach this page at all -- RoleGate (App.tsx) restricts the
   // /workspace route to admin/coordinator before this component ever mounts.
-  const title = user?.role === 'admin' ? 'Admin Workspace' : `${user?.name} — Workspace`;
+  const firstName = user?.name?.split(' ')[0] || 'there';
+  const greeting = `${greetingFor(new Date())}, ${firstName}`;
 
   return (
-    <div>
-      {/* Page Header */}
-      <div className="mb-6">
-        <h2 className="text-[20px] font-bold text-text">{title}</h2>
-        <p className="text-[13px] text-text2 mt-0.5">Today's tasks and personal notes</p>
+    // Static page, no scroll -- h-full + overflow-hidden resolves against
+    // MainLayout's own bounded content area. The summary tiles and greeting are
+    // fixed-height (flex-shrink-0); Priority Tasks and Notes share the remaining
+    // height side by side (flex-1 min-h-0), each scrolling internally once its
+    // own list grows past what that column has room for, so nothing ever pushes
+    // the page itself into a scrollbar.
+    <div className="h-full flex flex-col overflow-hidden">
+      <div className="mb-6 flex items-center gap-3 flex-shrink-0">
+        <Avatar name={user?.name} size="lg" />
+        <div>
+          <h2 className="text-[20px] font-bold text-text">{greeting}</h2>
+          <p className="text-[13px] text-text2 mt-0.5">Your schedule at a glance and personal notes -- for evaluating a session, see Scheduled Events</p>
+        </div>
       </div>
 
-      {/* Tabs */}
-      <div className="mb-6">
-        <UnderlineTabs
-          options={[
-            { label: 'Upcoming Tasks', value: 0, icon: Calendar },
-            { label: 'Scheduled Events', value: 1, icon: ClipboardList },
-            { label: 'My Notes', value: 2, icon: StickyNote },
-          ]}
-          value={activeTab}
-          onChange={setActiveTab}
-        />
+      <div className="flex-shrink-0">
+        <WorkspaceSummary />
       </div>
 
-      {/* Tab Content */}
-      {activeTab === 0 && (
-        <UpcomingTasksTab
-          onEvaluate={(task) => setEvaluationToReview(task)}
-          onEvaluateGroup={(items) => setGroupToEvaluate(items)}
-        />
-      )}
-      {activeTab === 1 && (
-        <ScheduledEventsTab
-          onEvaluate={(task) => setEvaluationToReview(task)}
-          onEvaluateGroup={(items) => setGroupToEvaluate(items)}
-        />
-      )}
-      {activeTab === 2 && <NotesTab />}
-
-      {evaluationToReview && (
-        <EvaluationResultModal
-          evaluation={evaluationToReview}
-          onClose={() => setEvaluationToReview(null)}
-          onSuccess={() => setEvaluationToReview(null)}
-        />
-      )}
-
-      {groupToEvaluate && (
-        <GroupEvaluationModal
-          items={groupToEvaluate}
-          onClose={() => setGroupToEvaluate(null)}
-        />
-      )}
+      {/* flex, not grid -- a CSS Grid's implicit row defaults to auto-sizing (as
+          tall as its content wants), which silently ignores flex-1/min-h-0 on
+          the grid container itself and let each panel's h-full resolve to its
+          own natural content height instead of the real space available (the
+          exact bug: at a shorter window height, panels quietly overflowed the
+          page instead of scrolling internally). Flexbox's min-h-0 is the same
+          fix already used everywhere else in this app's shell (MainLayout,
+          Sidebar) for exactly this class of problem, so this just matches that
+          proven pattern instead of fighting Grid's own sizing rules. */}
+      <div className="flex flex-col lg:flex-row gap-6 flex-1 min-h-0 mt-6">
+        <PriorityTasksSection />
+        <NotesPanel />
+      </div>
     </div>
   );
 }
 
 // ============================================
-// TAB 1: Upcoming Tasks
+// SUMMARY -- 4 at-a-glance tiles above the two sections below. Overdue/Due Today
+// are raw record counts (an eval bucket's real `count`, an NDA item as 1 each),
+// deliberately different from Priority Tasks' own "N open" (a count of *cards*,
+// i.e. buckets) -- "35 pending demos" is one card but 35 overdue records, and
+// both numbers are real/useful, just answering different questions.
 // ============================================
-function UpcomingTasksTab({
-  onEvaluate,
-  onEvaluateGroup,
-}: {
-  onEvaluate: (task: any) => void;
-  onEvaluateGroup: (items: Evaluation[]) => void;
-}) {
-  const { user } = useAuthStore();
-  const [dateFilter, setDateFilter] = useState('');
+function isOverdueItem(item: ReminderItem, today: string): boolean {
+  if (item.kind === 'eval') return item.date < today;
+  return new Date(item.proctor.nda_link_expires_at).getTime() < Date.now();
+}
+function isDueTodayItem(item: ReminderItem, today: string): boolean {
+  if (item.kind === 'eval') return item.date === today;
+  const diffDays = Math.ceil((new Date(item.proctor.nda_link_expires_at).getTime() - Date.now()) / 86_400_000);
+  return diffDays === 0;
+}
+const rawItemCount = (item: ReminderItem) => (item.kind === 'eval' ? item.count : 1);
 
-  const { data: tasks = [], isLoading } = useQuery({
-    queryKey: ['workspace-tasks', user?.username, dateFilter],
+const TILE_STYLES: Record<'danger' | 'warning' | 'neutral', { box: string; label: string; value: string; caption: string }> = {
+  danger: { box: 'bg-danger/10 border-danger/20', label: 'text-danger', value: 'text-danger', caption: 'text-danger/80' },
+  warning: { box: 'bg-warning/10 border-warning/20', label: 'text-warning', value: 'text-warning', caption: 'text-warning/80' },
+  neutral: { box: 'bg-surface2 border-border', label: 'text-text3', value: 'text-text', caption: 'text-text3' },
+};
+
+function WorkspaceSummary() {
+  const { user } = useAuthStore();
+  const { items, today } = useUpcomingReminders();
+  const { data: notes = [] } = useQuery({
+    queryKey: NOTES_QUERY_KEY(user?.id),
     queryFn: async () => {
-      // Admin sees ALL panels, coordinator sees own
+      const { data, error } = await supabase.from('user_notes').select('*').eq('user_id', user?.id).order('created_at', { ascending: false });
+      if (error) throw error;
+      return data as Note[];
+    },
+  });
+  // A separate, lightweight count -- useUpcomingReminders only ever fetches
+  // overdue-or-due-today evaluations (by design, for Priority Tasks/the
+  // notification bell); "next 7 days" needs the genuinely-future window those
+  // deliberately exclude, so this queries it directly rather than widening that
+  // hook's own scope for every one of its other consumers.
+  const { data: upcoming7dCount = 0 } = useQuery({
+    queryKey: ['workspace-upcoming-7d', user?.username, today],
+    queryFn: async () => {
+      const future = new Date(today + 'T00:00:00');
+      future.setDate(future.getDate() + 7);
       let query = supabase
         .from('proctor_evaluations')
-        .select('*')
+        .select('id', { count: 'exact', head: true })
         .is('result', null)
-        .order('scheduled_date', { ascending: true });
-
-      if (user?.role !== 'admin') {
-        query = query.eq('panel_user', user?.username);
-      }
-
-      const { data, error } = await query;
+        .gt('scheduled_date', today)
+        .lte('scheduled_date', localDateString(future));
+      if (user?.role !== 'admin') query = query.eq('panel_user', user?.username);
+      const { count, error } = await query;
       if (error) throw error;
-
-      let filtered = data as Evaluation[];
-      if (dateFilter) {
-        filtered = filtered.filter(t => t.scheduled_date === dateFilter);
-      }
-
-      return filtered;
+      return count || 0;
     },
   });
 
-  // Fetch proctors for task cards
-  const { data: proctors = [] } = useAllProctorsLookup();
+  const overdueCount = items.filter((i) => isOverdueItem(i, today)).reduce((sum, i) => sum + rawItemCount(i), 0);
+  const dueTodayCount = items.filter((i) => isDueTodayItem(i, today)).reduce((sum, i) => sum + rawItemCount(i), 0);
+  // NDA links expiring in 1-3 days -- neither overdue nor due today, so they
+  // belong in "Upcoming" alongside the next-7-days evaluation count above.
+  const ndaUpcomingCount = items.filter((i) => !isOverdueItem(i, today) && !isDueTodayItem(i, today)).length;
 
-  const today = new Date().toISOString().slice(0, 10);
-  const overdueRows = tasks.filter(t => t.scheduled_date < today);
-  const todayRows = tasks.filter(t => t.scheduled_date === today);
-  const upcomingRows = tasks.filter(t => t.scheduled_date > today);
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="flex flex-col items-center gap-3">
-          <LoadingSpinner size="md" />
-          <p className="text-text2 text-sm">Loading tasks...</p>
-        </div>
-      </div>
-    );
-  }
+  const tiles: { label: string; value: number; caption: string; tone: 'danger' | 'warning' | 'neutral' }[] = [
+    { label: 'Overdue', value: overdueCount, caption: 'Needs attention', tone: 'danger' },
+    { label: 'Due Today', value: dueTodayCount, caption: 'Before end of day', tone: 'warning' },
+    { label: 'Upcoming', value: upcoming7dCount + ndaUpcomingCount, caption: 'Next 7 days', tone: 'neutral' },
+    { label: 'My Notes', value: notes.length, caption: 'Personal reminders', tone: 'neutral' },
+  ];
 
   return (
-    <div>
-      {/* Date Filter */}
-      <div className="flex gap-2 items-center mb-4 flex-wrap">
-        <label className="text-[12px] text-text2">Filter by date:</label>
-        <Input
-          type="date"
-          value={dateFilter}
-          onChange={(e) => setDateFilter(e.target.value)}
-          wrapperClassName="w-auto"
-        />
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => setDateFilter('')}
-        >
-          Clear
-        </Button>
-      </div>
-
-      {/* Tasks */}
-      {tasks.length === 0 ? (
-        <div className="flex flex-col items-center justify-center h-64 gap-3">
-          <PartyPopper className="w-12 h-12 text-accent" />
-          <h3 className="text-text font-semibold">No upcoming tasks</h3>
-        </div>
-      ) : (
-        <div className="space-y-6">
-          {/* Overdue */}
-          {overdueRows.length > 0 && (
-            <div>
-              <div className="flex items-center gap-1.5 text-[12px] font-bold text-danger uppercase tracking-wider mb-2">
-                <AlertTriangle className="w-3.5 h-3.5" /> Overdue
-              </div>
-              <div className="space-y-2">
-                {groupByGroupId(overdueRows).map((group) =>
-                  group.length > 1 ? (
-                    <GroupScheduleCard key={group[0].group_id} items={group} when="overdue" showPanel={user?.role === 'admin'} onOpen={onEvaluateGroup} />
-                  ) : (
-                    <TaskCard
-                      key={group[0].id}
-                      task={group[0]}
-                      proctor={proctors.find(p => p.id === group[0].proctor_id)}
-                      when="overdue"
-                      showPanel={user?.role === 'admin'}
-                      onEvaluate={(item) => onEvaluate({ ...item, proctor: proctors.find((p) => p.id === item.proctor_id) })}
-                    />
-                  )
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Today */}
-          {todayRows.length > 0 && (
-            <div>
-              <div className="text-[12px] font-bold text-accent uppercase tracking-wider mb-2">
-                Today
-              </div>
-              <div className="space-y-2">
-                {groupByGroupId(todayRows).map((group) =>
-                  group.length > 1 ? (
-                    <GroupScheduleCard key={group[0].group_id} items={group} when="today" showPanel={user?.role === 'admin'} onOpen={onEvaluateGroup} />
-                  ) : (
-                    <TaskCard
-                      key={group[0].id}
-                      task={group[0]}
-                      proctor={proctors.find(p => p.id === group[0].proctor_id)}
-                      when="today"
-                      showPanel={user?.role === 'admin'}
-                      onEvaluate={(item) => onEvaluate({ ...item, proctor: proctors.find((p) => p.id === item.proctor_id) })}
-                    />
-                  )
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Upcoming */}
-          {upcomingRows.length > 0 && (
-            <div>
-              <div className="text-[12px] font-bold text-text3 uppercase tracking-wider mb-2">
-                Upcoming
-              </div>
-              <div className="space-y-2">
-                {groupByGroupId(upcomingRows).map((group) =>
-                  group.length > 1 ? (
-                    <GroupScheduleCard key={group[0].group_id} items={group} when="upcoming" showPanel={user?.role === 'admin'} onOpen={onEvaluateGroup} />
-                  ) : (
-                    <TaskCard
-                      key={group[0].id}
-                      task={group[0]}
-                      proctor={proctors.find(p => p.id === group[0].proctor_id)}
-                      when="upcoming"
-                      showPanel={user?.role === 'admin'}
-                      onEvaluate={(item) => onEvaluate({ ...item, proctor: proctors.find((p) => p.id === item.proctor_id) })}
-                    />
-                  )
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+    <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      {tiles.map((t) => {
+        const s = TILE_STYLES[t.tone];
+        return (
+          <div key={t.label} className={`rounded-lg border p-4 ${s.box}`}>
+            <div className={`text-[11px] font-bold uppercase tracking-wide ${s.label}`}>{t.label}</div>
+            <div className={`text-[26px] font-display font-bold mt-1 ${s.value}`}>{t.value}</div>
+            <div className={`text-[12px] mt-0.5 ${s.caption}`}>{t.caption}</div>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-interface TaskCardProps {
-  task: Evaluation;
-  proctor?: Proctor;
-  when: 'overdue' | 'today' | 'upcoming';
-  showPanel: boolean;
-  onEvaluate: (task: Evaluation & { proctor?: Proctor }) => void;
-}
+// ============================================
+// UPCOMING TASKS -- a short, capped digest of what needs attention soonest,
+// backed by the same useUpcomingReminders hook the notification bell uses (see
+// src/hooks/useUpcomingReminders.ts for the full rationale/query details). This
+// duplicates none of ScheduleBoard's data model -- the full backlog is already
+// fully visible on Scheduled Events itself; this section exists purely to
+// surface the handful that matter most without requiring a scroll through
+// everything else. Clicking a demo/assessment card goes to Scheduled Events,
+// pre-filtered to that exact date/type; clicking an NDA card opens that
+// proctor's record.
+// ============================================
+// How many items show as full, open cards before the rest collapse into the
+// stack -- mirrors NotesPanel's own VISIBLE_NOTE_COUNT treatment below.
+// Side-by-side with Notes now, each panel has real height to spare below 2 short
+// cards -- 4 fills that space without turning the digest into "show everything".
+// Task cards are more compact than note cards (one line + a badge, no due-date/
+// edit/delete rows), so this panel has room for more before hitting the same
+// bottom boundary Notes does at 3.
+const VISIBLE_TASK_COUNT = 5;
 
-function TaskCard({ task, proctor, when, showPanel, onEvaluate }: TaskCardProps) {
-  const borderColor =
-    when === 'overdue'
-      ? 'border-l-danger'
-      : when === 'today'
-      ? 'border-l-accent'
-      : 'border-l-border';
+function PriorityTasksSection() {
+  const { user } = useAuthStore();
+  const navigate = useNavigate();
+  const [stackExpanded, setStackExpanded] = useState(false);
+  const collapseRef = useCollapseOnOutsideClick(stackExpanded, () => setStackExpanded(false));
+  const { items, today, isLoading } = useUpcomingReminders();
 
-  const canEvaluate = canEvaluateNow(task.scheduled_date, task.scheduled_time);
+  const visible = items.slice(0, VISIBLE_TASK_COUNT);
+  const overflow = items.slice(VISIBLE_TASK_COUNT);
 
-  const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
+  const openReminder = (item: ReminderItem) => {
+    if (item.kind === 'eval') {
+      navigate('/scheduled-events', { state: { filters: { date: item.date, type: item.evalType } } });
+    } else {
+      navigate(proctorsPathFor(user?.role), { state: { openProctorId: item.proctor.id } });
+    }
   };
 
+  const renderItem = (item: ReminderItem) => (
+    <TaskDigestCard
+      key={item.kind === 'eval' ? `${item.evalType}-${item.date}` : item.proctor.id}
+      title={reminderTitle(item)}
+      badge={reminderBadge(item, today)}
+      description={reminderDescription(item)}
+      onOpen={() => openReminder(item)}
+    />
+  );
+
   return (
-    <div
-      className={`bg-surface border border-border rounded-lg p-4 flex items-center gap-3 border-l-[3px] ${borderColor}`}
-    >
-      <span
-        className={`text-[11px] font-bold px-2 py-1 rounded ${
-          task.eval_type === 'demo'
-            ? 'bg-purple-500/15 text-purple-400'
-            : 'bg-blue-500/15 text-blue-400'
-        }`}
-      >
-        {task.eval_type}
-      </span>
-
-      <div className="flex-1">
-        <div className="text-[13px] font-bold text-text">{proctor?.name || 'Unknown'}</div>
-        <div className="text-[11px] text-text3">
-          {showPanel && <span className="text-accent">Panel: {task.panel_user} · </span>}
-          {task.score_out_of && <span>Score out of: {task.score_out_of} · </span>}
-          {proctor?.vendor || proctor?.managed_by} · {proctor?.ptype} · Attempt #{task.attempt_number}
-          {task.scheduled_time && ` · ${task.scheduled_time}`}
+    <div ref={collapseRef} className="bg-surface border border-border rounded-lg p-4 h-full flex-1 min-h-0 min-w-0 flex flex-col">
+      {/* Header (+ the Collapse control, once expanded) stays outside the
+          scrolling region below it, so both are always visible regardless of
+          how far the list itself is scrolled. */}
+      <div className="flex items-end justify-between mb-3 flex-shrink-0">
+        <div className="flex items-center gap-1.5">
+          <ListChecks className="w-4 h-4 text-text3" />
+          <div>
+            <h3 className="text-[15px] font-bold text-text leading-tight">Priority Tasks</h3>
+            <p className="text-[12px] text-text3 mt-0.5">What needs your attention</p>
+          </div>
         </div>
+        {stackExpanded ? (
+          <button type="button" onClick={() => setStackExpanded(false)} className="text-[12px] font-semibold text-accent hover:underline flex-shrink-0">
+            Collapse
+          </button>
+        ) : (
+          items.length > 0 && <span className="text-[12px] text-text3 flex-shrink-0">{items.length} open</span>
+        )}
       </div>
 
-      <div className={`text-[12px] ${when === 'overdue' ? 'text-danger' : 'text-text3'}`}>
-        {formatDate(task.scheduled_date)}
-      </div>
-
-      {canEvaluate ? (
-        <Button variant="primary" size="sm" onClick={() => onEvaluate({ ...task, proctor })}>
-<FileEdit className="w-3.5 h-3.5" /> Evaluate
-        </Button>
+      {isLoading ? (
+        <div className="flex flex-col items-center gap-3 py-8">
+          <LoadingSpinner size="md" />
+        </div>
+      ) : items.length === 0 ? (
+        <EmptyState icon={ListChecks} title="All caught up" message="Nothing needs attention right now." compact />
       ) : (
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled
-          title={`Unlocks 30min before: ${formatDate(task.scheduled_date)}${task.scheduled_time ? ' ' + task.scheduled_time : ''}`}
-        >
-          <Lock className="w-3.5 h-3.5" /> {formatDate(task.scheduled_date)}
-        </Button>
+        // Always the panel's own internal scroll region (flex-1 min-h-0), not a
+        // fixed pixel max-height -- the panel itself is already height-bounded by
+        // the page's side-by-side grid, so this naturally fills whatever room
+        // that leaves, whether collapsed (short) or expanded (long).
+        <div className="space-y-2 flex-1 min-h-0 overflow-y-auto pr-1">
+          {visible.map(renderItem)}
+          {overflow.length > 0 &&
+            (stackExpanded ? (
+              overflow.map(renderItem)
+            ) : (
+              <PeekStack
+                peekTones={overflow.slice(0, 2).map((item) => reminderBadge(item, today).tone)}
+                label={`+${overflow.length} more`}
+                onExpand={() => setStackExpanded(true)}
+              />
+            ))}
+        </div>
       )}
     </div>
   );
 }
 
-// Helper function to check if evaluation can be done now (30 min before scheduled time)
-function canEvaluateNow(scheduledDate: string, scheduledTime?: string): boolean {
-  const now = new Date();
-  const schedDate = new Date(scheduledDate);
-  
-  if (scheduledTime) {
-    // Parse time like "10:00" or "14:30"
-    const [hours, minutes] = scheduledTime.split(':').map(Number);
-    schedDate.setHours(hours, minutes, 0, 0);
-    // Allow evaluation 30 minutes before scheduled time
-    const unlockTime = new Date(schedDate.getTime() - 30 * 60 * 1000);
-    return now >= unlockTime;
-  } else {
-    // If no time specified, allow on or after the scheduled date
-    return now >= schedDate;
-  }
-}
-
-/** One card per Group Assessment session (a Multi Assign batch -- see EvaluationsPage's
- * BulkAssessment, and groupByGroupId above) instead of one per candidate. Laid out just
- * like TaskCard (single button on the right) so a group is no different in kind from
- * any other schedule on this tab -- "Evaluate" opens GroupEvaluationModal, which is
- * where the candidate list and the Download/Upload actions actually live. */
-function GroupScheduleCard({
-  items,
-  when,
-  showPanel,
+function TaskDigestCard({
+  title,
+  badge,
+  description,
   onOpen,
 }: {
-  items: Evaluation[];
-  when: 'overdue' | 'today' | 'upcoming';
-  showPanel: boolean;
-  onOpen: (items: Evaluation[]) => void;
+  title: string;
+  badge: { label: string; tone: 'danger' | 'warning' };
+  description: string;
+  onOpen: () => void;
 }) {
-  const first = items[0];
-
-  const borderColor =
-    when === 'overdue' ? 'border-l-danger' : when === 'today' ? 'border-l-accent' : 'border-l-border';
-  const canEvaluate = canEvaluateNow(first.scheduled_date, first.scheduled_time);
-
-  const formatDate = (dateStr: string) => new Date(dateStr).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-
   return (
-    <div
-      className={`bg-surface border border-border rounded-lg p-4 flex items-center gap-3 border-l-[3px] ${borderColor}`}
+    <button
+      type="button"
+      onClick={onOpen}
+      title={`${title} — ${description}`}
+      className="w-full text-left bg-surface border border-border rounded-lg px-3 py-2.5 hover:border-border2 hover:shadow-sm transition-all"
     >
-      <span className="text-[11px] font-bold px-2 py-1 rounded bg-blue-500/15 text-blue-400 flex-shrink-0">
-        {first.eval_type}
-      </span>
-
-      <Users className="w-4 h-4 text-text3 flex-shrink-0" />
-
-      <div className="flex-1">
-        <div className="text-[13px] font-bold text-text">Group Assessment · {items.length} candidates</div>
-        <div className="text-[11px] text-text3">
-          {showPanel && <span className="text-accent">Panel: {first.panel_user} · </span>}
-          {first.score_out_of && <span>Score out of: {first.score_out_of} · </span>}
-          {items.length} candidate{items.length === 1 ? '' : 's'} awaiting a result
-          {first.scheduled_time && ` · ${first.scheduled_time}`}
-        </div>
-      </div>
-
-      <div className={`text-[12px] ${when === 'overdue' ? 'text-danger' : 'text-text3'}`}>
-        {formatDate(first.scheduled_date)}
-      </div>
-
-      {canEvaluate ? (
-        <Button variant="primary" size="sm" onClick={() => onOpen(items)}>
-          <FileEdit className="w-3.5 h-3.5" /> Evaluate
-        </Button>
-      ) : (
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled
-          title={`Unlocks 30min before: ${formatDate(first.scheduled_date)}${first.scheduled_time ? ' ' + first.scheduled_time : ''}`}
+      <div className="flex items-center justify-between gap-2 mb-0.5">
+        <span className="text-[12.5px] font-bold text-text truncate">{title}</span>
+        <span
+          className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
+            badge.tone === 'danger' ? 'bg-danger/10 text-danger' : 'bg-warning/10 text-warning'
+          }`}
         >
-          <Lock className="w-3.5 h-3.5" /> {formatDate(first.scheduled_date)}
-        </Button>
-      )}
-    </div>
-  );
-}
-
-// ============================================
-// TAB 2: Scheduled Events
-// ============================================
-function ScheduledEventsTab({
-  onEvaluate,
-  onEvaluateGroup,
-}: {
-  onEvaluate: (evaluation: any) => void;
-  onEvaluateGroup: (items: Evaluation[]) => void;
-}) {
-  const { user } = useAuthStore();
-  const queryClient = useQueryClient();
-  const [filters, setFilters] = useState<ScheduledEventFilters>({
-    date: '',
-    type: '',
-    vendor: '',
-    ptype: '',
-  });
-  const [editingItems, setEditingItems] = useState<Evaluation[] | null>(null);
-  const [page, setPage] = useState(1);
-  const PAGE_SIZE = 25;
-  const { data: managedByOptions = [] } = useManagedByOptions();
-
-  // Only fetch evaluations where result is null (pending/scheduled). `date`/`type`
-  // are plain columns on proctor_evaluations, so they filter server-side below.
-  // `vendor`/`ptype` filter on the *joined* proctor -- proctor_evaluations has no
-  // FK relationship registered with `proctors` in PostgREST's schema cache (verified
-  // live: a `select=*,proctors(...)` embed 400s with PGRST200 "no relationship
-  // found"), so an embedded-resource filter isn't available. They're re-applied
-  // client-side below instead, to just the rows on the current page. Tradeoff:
-  // when either is active, a "page" of nominally PAGE_SIZE rows can render fewer
-  // visible rows, and the pagination footer's count reflects the date/type-filtered
-  // total from the server, not the vendor/ptype-narrowed one actually on screen.
-  const { data: pageResult, isLoading, isFetching } = usePaginatedQuery<Evaluation>({
-    queryKey: ['scheduled-events', user?.username, filters.date, filters.type],
-    table: 'proctor_evaluations',
-    filters: (q) => {
-      let query = q.is('result', null);
-      if (user?.role !== 'admin') query = query.eq('panel_user', user?.username);
-      if (filters.date) query = query.eq('scheduled_date', filters.date);
-      if (filters.type) query = query.eq('eval_type', filters.type);
-      return query;
-    },
-    page,
-    pageSize: PAGE_SIZE,
-    orderBy: { column: 'scheduled_date', ascending: true }, // Ascending order like HTML
-  });
-
-  const scheduled = pageResult?.data ?? [];
-  const totalCount = pageResult?.count ?? 0;
-
-  // Fetch all proctors for filtering/join
-  const { data: allProctors = [] } = useAllProctorsLookup();
-
-  const filteredData = scheduled.filter((item: any) => {
-    const proctor = allProctors.find(p => p.id === item.proctor_id);
-    if (filters.vendor && (proctor?.vendor || proctor?.managed_by) !== filters.vendor) return false;
-    if (filters.ptype && proctor?.ptype !== filters.ptype) return false;
-    return true;
-  }).map((item: any) => ({
-    ...item,
-    proctor: allProctors.find(p => p.id === item.proctor_id)
-  }));
-
-  // Same group_id grouping as Upcoming Tasks -- a Multi Assign batch shows as one row
-  // here too instead of one per candidate. Grouped client-side over the current page's
-  // fetched rows (same tradeoff already noted above for the vendor/ptype filter: a
-  // group could in principle straddle a page boundary, though in practice this tab is
-  // scoped to result IS NULL, so a batch's members generally stay together until
-  // someone starts recording results).
-  const tableRows = groupByGroupId(filteredData).map((group) =>
-    group.length > 1 ? { ...group[0], _isGroup: true as const, _groupItems: group } : group[0]
-  );
-
-  const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-  };
-
-  return (
-    <div>
-      {/* Filters */}
-      <div className="flex gap-2 mb-4 flex-wrap items-center">
-        <Input
-          type="date"
-          value={filters.date}
-          onChange={(e) => {
-            setFilters({ ...filters, date: e.target.value });
-            setPage(1);
-          }}
-          wrapperClassName="w-auto"
-        />
-        <Select
-          options={[
-            { value: '', label: 'All Types' },
-            { value: 'demo', label: 'Demo' },
-            { value: 'assessment', label: 'Assessment' },
-          ]}
-          value={filters.type}
-          onChange={(e) => {
-            setFilters({ ...filters, type: e.target.value as any });
-            setPage(1);
-          }}
-          wrapperClassName="min-w-[140px]"
-        />
-        <Select
-            options={[
-              { value: '', label: 'All Vendors' },
-              ...managedByOptions,
-            ]}
-          value={filters.vendor}
-          onChange={(e) => {
-            setFilters({ ...filters, vendor: e.target.value as any });
-            setPage(1);
-          }}
-          wrapperClassName="min-w-[160px]"
-        />
-        <Select
-          options={[
-            { value: '', label: 'All Proctor Types' },
-            ...PROCTOR_TYPES.map((t) => ({ value: t, label: t })),
-          ]}
-          value={filters.ptype}
-          onChange={(e) => {
-            setFilters({ ...filters, ptype: e.target.value as any });
-            setPage(1);
-          }}
-          wrapperClassName="min-w-[160px]"
-        />
-        <ClearFiltersButton
-          show={!!(filters.date || filters.type || filters.vendor || filters.ptype)}
-          onClick={() => {
-            setFilters({ date: '', type: '', vendor: '', ptype: '' });
-            setPage(1);
-          }}
-        />
+          {badge.label}
+        </span>
       </div>
-
-      {/* Table */}
-      <Table
-        data={tableRows}
-        isLoading={isLoading}
-        emptyMessage="No scheduled events"
-        pagination={{ page, pageSize: PAGE_SIZE, count: totalCount, isFetching, onPageChange: setPage }}
-        columns={[
-          {
-            header: 'Proctor',
-            accessor: (item: any) =>
-              item._isGroup ? (
-                <div className="flex items-center gap-1.5">
-                  <Users className="w-3.5 h-3.5 text-text3 flex-shrink-0" />
-                  <span className="text-[13px] font-semibold text-text">Group Assessment · {item._groupItems.length} candidates</span>
-                </div>
-              ) : (
-                <>
-                  <div className="text-[13px] font-semibold text-text">{item.proctor?.name || 'Unknown'}</div>
-                  <div className="text-[11px] text-text3">
-                    {item.proctor?.email || ''} · {item.proctor?.vendor || item.proctor?.managed_by}
-                  </div>
-                </>
-              ),
-          },
-          {
-            header: 'Type',
-            accessor: (item: any) => (
-              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded ${
-                item.eval_type === 'demo'
-                  ? 'bg-purple-500/15 text-purple-400'
-                  : 'bg-blue-500/15 text-blue-400'
-              }`}>
-                {item.eval_type}
-              </span>
-            ),
-          },
-          { header: 'Panel', accessor: (item: any) => item.panel_user, className: 'text-[12px] text-text2' },
-          {
-            header: 'Scheduled Date & Time',
-            accessor: (item: any) => (
-              <>
-                {formatDate(item.scheduled_date)}
-                {item.scheduled_time && ` · ${item.scheduled_time}`}
-              </>
-            ),
-            className: 'text-[12px] text-text2',
-          },
-          {
-            header: 'Attempt',
-            accessor: (item: any) =>
-              item._isGroup ? (
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-surface2 text-text">
-                  {item._groupItems.length} candidates
-                </span>
-              ) : (
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-surface2 text-text">
-                  #{item.attempt_number}
-                </span>
-              ),
-          },
-          {
-            header: 'Status',
-            accessor: () => (
-              <span className="inline-flex items-center gap-1 text-[11px] font-bold text-accent">
-                <Calendar className="w-3 h-3" /> Scheduled
-              </span>
-            ),
-          },
-          {
-            header: 'Score Out Of',
-            accessor: (item: any) => item.score_out_of || '—',
-            className: 'text-[11px] font-mono text-text2',
-          },
-          {
-            header: 'Actions',
-            accessor: (item: any) =>
-              item._isGroup ? (
-                <div className="flex gap-1">
-                  {canEvaluateNow(item.scheduled_date, item.scheduled_time) ? (
-                    <Button variant="primary" size="sm" onClick={() => onEvaluateGroup(item._groupItems)}>
-                      <FileEdit className="w-3.5 h-3.5" /> Evaluate
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled
-                      title={`Unlocks 30min before: ${formatDate(item.scheduled_date)}${item.scheduled_time ? ' ' + item.scheduled_time : ''}`}
-                    >
-                      <Lock className="w-3.5 h-3.5" /> {formatDate(item.scheduled_date)}
-                    </Button>
-                  )}
-                  {user?.role === 'admin' && (
-                    <Button variant="ghost" size="sm" onClick={() => setEditingItems(item._groupItems)}>
-                      <Pencil className="w-3.5 h-3.5" /> Edit
-                    </Button>
-                  )}
-                </div>
-              ) : (
-                <div className="flex gap-1">
-                  {canEvaluateNow(item.scheduled_date, item.scheduled_time) ? (
-                    <Button variant="primary" size="sm" onClick={() => onEvaluate(item)}>
-                      <FileEdit className="w-3.5 h-3.5" /> Evaluate
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled
-                      title={`Unlocks 30min before: ${formatDate(item.scheduled_date)}${item.scheduled_time ? ' ' + item.scheduled_time : ''}`}
-                    >
-                      <Lock className="w-3.5 h-3.5" /> {formatDate(item.scheduled_date)}
-                    </Button>
-                  )}
-                  {user?.role === 'admin' && (
-                    <Button variant="ghost" size="sm" onClick={() => setEditingItems([item])}>
-                      <Pencil className="w-3.5 h-3.5" /> Edit
-                    </Button>
-                  )}
-                </div>
-              ),
-          },
-        ]}
-      />
-
-      {/* Edit/Reschedule Modal -- items.length > 1 for a group edits every candidate's
-          panel/date/time/score together, keeping them in sync as one group schedule. */}
-      {editingItems && (
-        <RescheduleModal
-          items={editingItems}
-          proctors={allProctors}
-          onClose={() => setEditingItems(null)}
-          onSuccess={() => {
-            queryClient.invalidateQueries({ queryKey: ['scheduled-events'] });
-            queryClient.invalidateQueries({ queryKey: ['workspace-tasks'] });
-            setEditingItems(null);
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-/** What "Evaluate" opens for a Group Assessment session, from either tab -- the
- * candidate list plus the Download/Upload actions that used to live inline on the
- * card/row itself. Centralizing them here is what let both places shrink back down
- * to the same single "Evaluate" button every other schedule type already has. */
-function GroupEvaluationModal({
-  items,
-  onClose,
-}: {
-  items: Evaluation[];
-  onClose: () => void;
-}) {
-  const uploadInputRef = useRef<HTMLInputElement | null>(null);
-  const { data: proctors = [] } = useAllProctorsLookup();
-  const { busy, handleDownload, handleUpload } = useGroupEvaluationActions(items, proctors);
-  const first = items[0];
-  const canEvaluate = canEvaluateNow(first.scheduled_date, first.scheduled_time);
-
-  const formatDate = (dateStr: string) => new Date(dateStr).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-
-  return (
-    <Modal isOpen={true} onClose={onClose} title={`Group Assessment · ${items.length} candidates`}>
-      <div className="space-y-4">
-        <div className="text-[12px] text-text3">
-          <span className="text-accent">Panel: {first.panel_user}</span>
-          {' · '}{formatDate(first.scheduled_date)}
-          {first.scheduled_time && ` · ${first.scheduled_time}`}
-          {first.score_out_of ? ` · Score out of: ${first.score_out_of}` : ''}
-        </div>
-
-        <div className="rounded-md border border-border divide-y divide-border overflow-hidden max-h-80 overflow-y-auto">
-          {items.map((task) => {
-            const proctor = proctors.find((p) => p.id === task.proctor_id);
-            return (
-              <div key={task.id} className="flex items-center justify-between gap-2 px-3 py-1.5 bg-surface2/40">
-                <div className="min-w-0">
-                  <div className="text-[12px] font-semibold text-text truncate">{proctor?.name || 'Unknown'}</div>
-                  <div className="text-[10px] text-text3">
-                    {(proctor?.vendor || proctor?.managed_by) && `${proctor?.vendor || proctor?.managed_by} · `}
-                    {proctor?.ptype} · Attempt #{task.attempt_number}
-                  </div>
-                </div>
-                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${task.result ? 'bg-success/10 text-success' : 'bg-surface text-text3'}`}>
-                  {task.result || 'Pending'}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="flex items-center gap-2 flex-wrap pt-2 border-t border-border">
-          <Button variant="ghost" size="sm" onClick={handleDownload} disabled={busy}>
-            <Download className="w-3.5 h-3.5" /> Download Evaluation Sheet
-          </Button>
-          {canEvaluate ? (
-            <>
-              <Button variant="primary" size="sm" onClick={() => uploadInputRef.current?.click()} disabled={busy}>
-                <Upload className="w-3.5 h-3.5" /> {busy ? 'Processing…' : 'Upload Completed Sheet'}
-              </Button>
-              <input ref={uploadInputRef} type="file" accept=".xlsx" className="hidden" onChange={handleUpload} />
-            </>
-          ) : (
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled
-              title={`Unlocks 30min before: ${formatDate(first.scheduled_date)}${first.scheduled_time ? ' ' + first.scheduled_time : ''}`}
-            >
-              <Lock className="w-3.5 h-3.5" /> Locked
-            </Button>
-          )}
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function EvaluationResultModal({
-  evaluation,
-  onClose,
-  onSuccess,
-}: {
-  evaluation: any;
-  onClose: () => void;
-  onSuccess: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const [result, setResult] = useState(evaluation.result || '');
-  const [score, setScore] = useState(
-    evaluation.score_obtained != null ? String(evaluation.score_obtained) : ''
-  );
-  const [comment, setComment] = useState(evaluation.comment || '');
-  const [commentOther, setCommentOther] = useState('');
-  const [sessionCode, setSessionCode] = useState(evaluation.session_code || '');
-  const [candidateId, setCandidateId] = useState(evaluation.candidate_id || '');
-  const [sectionId, setSectionId] = useState(evaluation.section_id || '');
-  const [errors, setErrors] = useState<Record<string, string>>({});
-
-  const needsEvidence = result && result !== 'No Show';
-  const previewUrl =
-    !needsEvidence ? '' :
-    evaluation.eval_type === 'demo'
-      ? (sessionCode ? `https://recruit.talview.com/recruiter/live-session/${sessionCode}` : '')
-      : (candidateId && sectionId ? `https://recruit.talview.com/recruiter/invites/${candidateId}/assessment-section/${sectionId}/answers` : '');
-
-  const { data: proctor } = useQuery({
-    queryKey: ['workspace-eval-proctor', evaluation.proctor_id],
-    queryFn: async () => {
-      if (evaluation.proctor) return evaluation.proctor;
-      const { data, error } = await supabase
-        .from('proctors')
-        .select('id, name, vendor, managed_by, email')
-        .eq('id', evaluation.proctor_id)
-        .single();
-
-      if (error) throw error;
-      return data;
-    },
-  });
-
-  const submitMutation = useMutation({
-    mutationFn: async () => {
-      const newErrors: Record<string, string> = {};
-
-      if (!result) newErrors.result = 'Result is required';
-      if (!score || isNaN(Number(score))) newErrors.score = 'Score is required';
-      else if (Number(score) < 0) newErrors.score = 'Score cannot be negative';
-      else if (evaluation.score_out_of && Number(score) > evaluation.score_out_of) {
-        newErrors.score = `Score cannot exceed ${evaluation.score_out_of}`;
-      }
-      if (['Reattempt', 'Reschedule'].includes(result) && !comment && !commentOther) {
-        newErrors.comment = 'Comment is required for ' + result;
-      }
-      if (needsEvidence) {
-        if (evaluation.eval_type === 'demo') {
-          if (!sessionCode.trim()) newErrors.sessionCode = 'Session Code is required';
-        } else {
-          if (!candidateId.trim()) newErrors.candidateId = 'Candidate ID is required';
-          if (!sectionId.trim()) newErrors.sectionId = 'Section ID is required';
-        }
-      }
-
-      if (Object.keys(newErrors).length > 0) {
-        setErrors(newErrors);
-        throw new Error('Validation failed');
-      }
-
-      const finalComment = comment === 'Other' ? commentOther : [comment, commentOther].filter(Boolean).join(' — ');
-
-      const { error: evalError } = await supabase.rpc('submit_evaluation_result', {
-        p_evaluation_id: evaluation.id,
-        p_result: result,
-        p_score: Number(score),
-        p_comment: finalComment,
-        p_session_code: evaluation.eval_type === 'demo' ? sessionCode.trim() : null,
-        p_candidate_id: evaluation.eval_type !== 'demo' ? candidateId.trim() : null,
-        p_section_id: evaluation.eval_type !== 'demo' ? sectionId.trim() : null,
-      });
-
-      if (evalError) throw evalError;
-
-      const evidenceNote = evaluation.eval_type === 'demo'
-        ? (sessionCode ? ` · Session Code: ${sessionCode}` : '')
-        : (candidateId || sectionId ? ` · Candidate ID: ${candidateId} · Section ID: ${sectionId}` : '');
-
-      await logAudit({
-        action: evaluation.result ? 'Eval Override' : 'Eval Result',
-        target: proctor?.name || evaluation.proctor_id,
-        detail: `${evaluation.eval_type} Attempt #${evaluation.attempt_number}: ${result}${finalComment ? ` — ${finalComment}` : ''}${evidenceNote}${evaluation.result ? ` [overrides: ${evaluation.result}]` : ''} · by ${useAuthStore.getState().user?.username || useAuthStore.getState().user?.name || 'system'}`,
-        user: useAuthStore.getState().user?.username || useAuthStore.getState().user?.name || null,
-      });
-    },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ['workspace-tasks'] });
-      await queryClient.invalidateQueries({ queryKey: ['scheduled-events'] });
-      await queryClient.invalidateQueries({ queryKey: ['evaluations-results'] });
-      onSuccess();
-      showAlert('Result saved', { tone: 'success' });
-    },
-    onError: (error: any) => {
-      if (error.message !== 'Validation failed') {
-        showAlert('Save failed: ' + error.message, { tone: 'error' });
-      }
-    },
-  });
-
-  const commentOptions = result ? [...(EVAL_REASON_OPTIONS_BY_RESULT[result] || []), 'Other'] : [];
-
-  const finalCommentValue = comment === 'Other' ? commentOther : comment;
-
-  return (
-    <Modal isOpen={true} onClose={onClose} title={`${evaluation.result ? 'Override Result' : 'Evaluate'} — ${evaluation.eval_type}`}>
-      <div className="space-y-4">
-        <div className="text-xs text-text2">
-          <div>
-            <strong>{proctor?.name || 'Unknown'}</strong> ({proctor?.vendor || proctor?.managed_by || '—'}) · {evaluation.eval_type} · Panel: {evaluation.panel_user} · Scheduled: {formatDateTime(evaluation.scheduled_date, evaluation.scheduled_time)} · Attempt #{evaluation.attempt_number}
-            {evaluation.score_out_of && ` · Score out of: ${evaluation.score_out_of}`}
-          </div>
-          {evaluation.result && (
-            <div className="bg-warning/10 border border-warning/30 rounded-lg p-2 mt-2 flex items-start gap-1.5">
-              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-              <span>Result already submitted as <strong>{evaluation.result}</strong>. Admin override will be logged.</span>
-            </div>
-          )}
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs font-semibold text-text mb-1">
-              Result <span className="text-danger">*</span>
-            </label>
-            <Select
-              options={[
-                { value: '', label: 'Select result...' },
-                { value: 'Pass', label: 'Pass' },
-                { value: 'Reattempt', label: 'Reattempt' },
-                { value: 'No Show', label: 'No Show' },
-                { value: 'Reschedule', label: 'Reschedule' },
-              ]}
-              value={result}
-              onChange={(e) => {
-                setResult(e.target.value);
-                setComment('');
-                setCommentOther('');
-                setErrors({ ...errors, result: '' });
-              }}
-            />
-            {errors.result && <div className="text-danger text-xs mt-1">{errors.result}</div>}
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-text mb-1">
-              Score {evaluation.score_out_of && <span className="text-text3">(out of {evaluation.score_out_of})</span>} <span className="text-danger">*</span>
-            </label>
-            <Input
-              type="number"
-              min={0}
-              max={evaluation.score_out_of || undefined}
-              value={score}
-              onChange={(e) => {
-                setScore(e.target.value);
-                setErrors({ ...errors, score: '' });
-              }}
-              placeholder="Enter score..."
-            />
-            {errors.score && <div className="text-danger text-xs mt-1">{errors.score}</div>}
-          </div>
-        </div>
-
-        {needsEvidence && (
-          <div className="bg-surface2 border border-border rounded-lg p-3">
-            <div className="text-xs font-semibold text-text mb-2">
-              Evidence <span className="text-text3 font-normal normal-case">(builds the result URL automatically)</span>
-            </div>
-            {evaluation.eval_type === 'demo' ? (
-              <div>
-                <label className="block text-[11px] font-semibold text-text2 mb-1">
-                  Session Code <span className="text-danger">*</span>
-                </label>
-                <Input
-                  placeholder="e.g. abc123"
-                  value={sessionCode}
-                  onChange={(e) => {
-                    setSessionCode(e.target.value);
-                    setErrors({ ...errors, sessionCode: '' });
-                  }}
-                />
-                {errors.sessionCode && <div className="text-danger text-xs mt-1">{errors.sessionCode}</div>}
-              </div>
-            ) : (
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-[11px] font-semibold text-text2 mb-1">
-                    Candidate ID <span className="text-danger">*</span>
-                  </label>
-                  <Input
-                    placeholder="e.g. 12345"
-                    value={candidateId}
-                    onChange={(e) => {
-                      setCandidateId(e.target.value);
-                      setErrors({ ...errors, candidateId: '' });
-                    }}
-                  />
-                  {errors.candidateId && <div className="text-danger text-xs mt-1">{errors.candidateId}</div>}
-                </div>
-                <div>
-                  <label className="block text-[11px] font-semibold text-text2 mb-1">
-                    Section ID <span className="text-danger">*</span>
-                  </label>
-                  <Input
-                    placeholder="e.g. 67890"
-                    value={sectionId}
-                    onChange={(e) => {
-                      setSectionId(e.target.value);
-                      setErrors({ ...errors, sectionId: '' });
-                    }}
-                  />
-                  {errors.sectionId && <div className="text-danger text-xs mt-1">{errors.sectionId}</div>}
-                </div>
-              </div>
-            )}
-            {previewUrl && (
-              <a
-                href={previewUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 text-[11px] text-accent font-semibold hover:underline mt-2 truncate max-w-full"
-              >
-                {previewUrl}
-              </a>
-            )}
-          </div>
-        )}
-
-        <div>
-          <label className="block text-xs font-semibold text-text mb-1">
-            Comment {['Reattempt', 'Reschedule'].includes(result) && <span className="text-danger">*</span>}
-          </label>
-          <Select
-            options={[
-              { value: '', label: 'Select reason...' },
-              ...commentOptions.map((c) => ({ value: c, label: c })),
-            ]}
-            value={comment}
-            onChange={(e) => {
-              setComment(e.target.value);
-              setErrors({ ...errors, comment: '' });
-            }}
-          />
-          {comment === 'Other' && (
-            <textarea
-              value={commentOther}
-              onChange={(e) => setCommentOther(e.target.value)}
-              placeholder="Enter reason..."
-              rows={3}
-              className="w-full mt-2 px-3 py-2 bg-surface2 border border-border rounded-lg text-[13px] text-text outline-none focus:border-accent resize-none"
-            />
-          )}
-          {finalCommentValue && (
-            <div className="text-[11px] text-text3 mt-1">Selected: {finalCommentValue}</div>
-          )}
-          {errors.comment && <div className="text-danger text-xs mt-1">{errors.comment}</div>}
-        </div>
-
-        <div className="flex gap-2 justify-end pt-4 border-t border-border">
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            variant="primary"
-            onClick={() => submitMutation.mutate()}
-            disabled={submitMutation.isPending}
-          >
-            <Save className="w-4 h-4" /> Submit Evaluation
-          </Button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function formatDateTime(date?: string, time?: string) {
-  if (!date) return '—';
-  const d = new Date(date);
-  const dateStr = d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-  return time ? `${dateStr} ${time}` : dateStr;
-}
-
-// ============================================
-// Reschedule/Edit Event Modal
-// ============================================
-interface RescheduleModalProps {
-  /** One item edits a single candidate's schedule; more than one (a group -- every
-   * member shares group_id) edits panel/date/time/score for every member at once,
-   * keeping them in sync as one group schedule. All members of a real group already
-   * share these fields, so items[0]'s values are the correct starting point either way. */
-  items: Evaluation[];
-  /** Already-loaded proctor lookup (e.g. useAllProctorsLookup) -- for the modal title
-   * and each item's audit-log target, without a separate fetch per candidate. */
-  proctors: Proctor[];
-  onClose: () => void;
-  onSuccess: () => void;
-}
-
-function RescheduleModal({ items, proctors, onClose, onSuccess }: RescheduleModalProps) {
-  const first = items[0];
-  const isGroup = items.length > 1;
-  const [panelUser, setPanelUser] = useState(first.panel_user || '');
-  const [scheduledDate, setScheduledDate] = useState(first.scheduled_date || '');
-  const [scheduledTime, setScheduledTime] = useState(first.scheduled_time || '');
-  const [scoreOutOf, setScoreOutOf] = useState(first.score_out_of?.toString() || '');
-
-  // Fetch panel users (coordinators)
-  const { data: panelUsers = [] } = useQuery({
-    queryKey: ['panel-users'],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from('users')
-        .select('username')
-        .in('role', ['coordinator', 'admin']);
-
-      if (error) throw error;
-      return data.map((u: any) => u.username);
-    },
-  });
-
-  const proctorName = (proctorId: string) => proctors.find((p) => p.id === proctorId)?.name;
-
-  const saveMutation = useMutation({
-    mutationFn: async () => {
-      if (!scheduledDate) throw new Error('Date is required');
-
-      const today = new Date().toISOString().slice(0, 10);
-      if (scheduledDate < today) {
-        throw new Error('Cannot reschedule to a past date');
-      }
-
-      const actor = useAuthStore.getState().user?.username || useAuthStore.getState().user?.name || 'system';
-      const results = await runWithConcurrency(items, 4, async (item) => {
-        const { error } = await supabase.rpc('reschedule_evaluation', {
-          p_evaluation_id: item.id,
-          p_panel_user: panelUser || null,
-          p_scheduled_date: scheduledDate,
-          p_scheduled_time: scheduledTime || null,
-          p_score_out_of: scoreOutOf ? parseFloat(scoreOutOf) : null,
-        });
-        if (error) throw error;
-
-        await logAudit({
-          action: 'Assessment Scheduled',
-          target: proctorName(item.proctor_id) || item.proctor_id,
-          detail: `Rescheduled${isGroup ? ' (group)' : ''} by ${actor} · ${scheduledDate}${scheduledTime ? ` ${scheduledTime}` : ''}`,
-          user: actor,
-        });
-      });
-
-      const failed = results.filter((r) => r.status === 'rejected');
-      if (failed.length > 0) {
-        throw new Error(`${failed.length} of ${items.length} candidate(s) failed to update`);
-      }
-    },
-    onSuccess: () => {
-      showAlert(isGroup ? `${items.length} candidates rescheduled` : 'Event updated successfully', { tone: 'success' });
-      onSuccess();
-    },
-    onError: (error: any) => {
-      showAlert('Failed: ' + error.message, { tone: 'error' });
-    },
-  });
-
-  return (
-    <Modal
-      isOpen={true}
-      onClose={onClose}
-      title={isGroup ? `Edit Group Assessment — ${items.length} candidates` : `Edit ${first.eval_type} — ${proctorName(first.proctor_id) || 'Unknown'}`}
-    >
-      <div className="space-y-4">
-        <div>
-          <label className="block text-[12px] font-semibold text-text mb-1">
-            Panel (Coordinator)
-          </label>
-          <Select
-            options={[
-              { value: '', label: 'Select...' },
-              ...panelUsers.map((u: string) => ({ value: u, label: u })),
-            ]}
-            value={panelUser}
-            onChange={(e) => setPanelUser(e.target.value)}
-          />
-        </div>
-
-        <div>
-          <label className="block text-[12px] font-semibold text-text mb-1">
-            Scheduled Date <span className="text-danger">*</span>
-          </label>
-          <Input
-            type="date"
-            value={scheduledDate}
-            onChange={(e) => setScheduledDate(e.target.value)}
-          />
-        </div>
-
-        <div>
-          <label className="block text-[12px] font-semibold text-text mb-1">
-            Scheduled Time
-          </label>
-          <Input
-            type="time"
-            value={scheduledTime}
-            onChange={(e) => setScheduledTime(e.target.value)}
-          />
-        </div>
-
-        <div>
-          <label className="block text-[12px] font-semibold text-text mb-1">
-            Score Out Of
-          </label>
-          <Input
-            type="number"
-            value={scoreOutOf}
-            onChange={(e) => setScoreOutOf(e.target.value)}
-            placeholder="e.g. 100"
-            min="1"
-          />
-        </div>
-
-        <div className="flex gap-2 justify-end pt-4 border-t border-border">
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            variant="primary"
-            onClick={() => saveMutation.mutate()}
-            disabled={saveMutation.isPending}
-          >
-            <Save className="w-4 h-4" /> Save Changes
-          </Button>
-        </div>
-      </div>
-    </Modal>
+      <div className="text-[11px] text-text3 truncate">{description}</div>
+    </button>
   );
 }
 
 // ============================================
-// TAB 3: My Notes
+// NOTES PANEL -- previously its own tab ("My Notes"); now a persistent sidebar
+// next to the schedule instead of a click away. Same query/mutations, just a
+// narrower vertical layout in place of the old 4-column grid.
 // ============================================
-function NotesTab() {
+// How many notes show as full, open cards before the rest collapse into the stack.
+const VISIBLE_NOTE_COUNT = 3;
+
+function NotesPanel() {
   const { user } = useAuthStore();
   const queryClient = useQueryClient();
   const [showModal, setShowModal] = useState(false);
   const [editingNote, setEditingNote] = useState<Note | null>(null);
+  const [stackExpanded, setStackExpanded] = useState(false);
+  const collapseRef = useCollapseOnOutsideClick(stackExpanded, () => setStackExpanded(false));
 
   const { data: notes = [], isLoading } = useQuery({
-    queryKey: ['user-notes', user?.id],
+    queryKey: NOTES_QUERY_KEY(user?.id),
     queryFn: async () => {
       const { data, error } = await supabase
         .from('user_notes')
@@ -1268,33 +383,59 @@ function NotesTab() {
   });
 
   return (
-    <div>
-      {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <div className="text-[13px] text-text2">Your private notes — only visible to you</div>
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={() => {
-            setEditingNote(null);
-            setShowModal(true);
-          }}
-        >
-          + Add Note
-        </Button>
+    <div ref={collapseRef} className="bg-surface border border-border rounded-lg p-4 h-full flex-1 min-h-0 min-w-0 flex flex-col">
+      {/* Header (+ Collapse, once expanded) stays outside the scrolling region
+          below it, same treatment as Priority Tasks. */}
+      <div className="flex items-end justify-between mb-3 flex-shrink-0">
+        <div className="flex items-center gap-1.5">
+          <StickyNote className="w-4 h-4 text-text3" />
+          <div>
+            <h3 className="text-[15px] font-bold text-text leading-tight">Notes</h3>
+            <p className="text-[12px] text-text3 mt-0.5">Only visible to you</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 flex-shrink-0">
+          {stackExpanded && (
+            <button type="button" onClick={() => setStackExpanded(false)} className="text-[12px] font-semibold text-accent hover:underline">
+              Collapse
+            </button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setEditingNote(null);
+              setShowModal(true);
+            }}
+          >
+            <Plus className="w-3.5 h-3.5" /> Add
+          </Button>
+        </div>
       </div>
 
-      {/* Notes Grid */}
+      {/* Notes list -- a narrow vertical stack, not the old 4-column grid, since
+          this now shares the page with tasks instead of having it to itself.
+          Sorted by nearest due date first (undated notes sort last) so the 2 that
+          stay open as full cards are the most time-sensitive ones; anything past
+          that collapses into a single fanned "stack" (like an iOS/macOS notification
+          stack) instead of pushing the panel's height out indefinitely. */}
       {isLoading ? (
-        <div className="flex flex-col items-center gap-3 py-12">
+        <div className="flex flex-col items-center gap-3 py-8">
           <LoadingSpinner size="md" />
-          <p className="text-text2 text-sm">Loading notes...</p>
         </div>
       ) : notes.length === 0 ? (
-        <EmptyState icon={StickyNote} title="No notes yet" message="Click + Add Note to create one." compact />
+        <EmptyState icon={StickyNote} title="No notes yet" message="Click Add to create one." compact />
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {notes.map((note) => (
+        (() => {
+          const sorted = [...notes].sort((a, b) => {
+            const aDue = a.due_date ? new Date(a.due_date).getTime() : Infinity;
+            const bDue = b.due_date ? new Date(b.due_date).getTime() : Infinity;
+            return aDue - bDue;
+          });
+          const visible = sorted.slice(0, VISIBLE_NOTE_COUNT);
+          const overflow = sorted.slice(VISIBLE_NOTE_COUNT);
+
+          const renderCard = (note: Note) => (
             <NoteCard
               key={note.id}
               note={note}
@@ -1307,8 +448,28 @@ function NotesTab() {
                 toggleDoneMutation.mutate({ id: note.id, done: !note.done })
               }
             />
-          ))}
-        </div>
+          );
+
+          // Same collapsed-natural-height / expanded-fixed-height-with-internal-
+          // scroll treatment as Priority Tasks -- Collapse lives in the header
+          // above, not down here, so it stays visible while this scrolls.
+          return (
+            <div className="space-y-2.5 flex-1 min-h-0 overflow-y-auto pr-1">
+              {visible.map(renderCard)}
+
+              {overflow.length > 0 &&
+                (stackExpanded ? (
+                  overflow.map(renderCard)
+                ) : (
+                  <PeekStack
+                    peekTones={overflow.slice(0, 2).map((n) => n.colour || n.color || 'yellow')}
+                    label={`+${overflow.length} more note${overflow.length === 1 ? '' : 's'}`}
+                    onExpand={() => setStackExpanded(true)}
+                  />
+                ))}
+            </div>
+          );
+        })()
       )}
 
       {/* Note Modal */}
@@ -1327,6 +488,44 @@ function NotesTab() {
         />
       )}
     </div>
+  );
+}
+
+// Every "tone" either a note's own color or a task's urgency can carry, mapped
+// to the sliver's border/fill -- warning/danger reuse the same semantic tokens
+// TaskDigestCard's badge already does, so a stacked task's peek matches its own
+// (unstacked) badge color.
+const PEEK_TONE_CLASSES: Record<string, string> = {
+  red: 'bg-red-500/15 border-red-500/30',
+  yellow: 'bg-yellow-500/15 border-yellow-500/30',
+  green: 'bg-green-500/15 border-green-500/30',
+  blue: 'bg-blue-500/15 border-blue-500/30',
+  danger: 'bg-danger/15 border-danger/30',
+  warning: 'bg-warning/15 border-warning/30',
+};
+
+/** A fanned, iOS/macOS-notification-style stack standing in for however many
+ * items didn't make the visible-card cut -- a couple of slightly offset
+ * "sliver" layers peeking out behind a summary bar, tinted from the actual
+ * items underneath so it reads as "more of these," not a generic counter.
+ * Clicking it expands the real list in place. Shared by NotesPanel and
+ * UpcomingTasksPanel (see each one's own stackExpanded state). */
+function PeekStack({ peekTones, label, onExpand }: { peekTones: string[]; label: string; onExpand: () => void }) {
+  const peekClasses = peekTones.slice(0, 2).map((t) => PEEK_TONE_CLASSES[t] || PEEK_TONE_CLASSES.yellow);
+
+  return (
+    <button type="button" onClick={onExpand} className="relative w-full pt-2 pb-1 text-left group">
+      {peekClasses[1] && (
+        <div className={`absolute inset-x-3 top-0 h-3.5 rounded-lg border ${peekClasses[1]}`} />
+      )}
+      {peekClasses[0] && (
+        <div className={`absolute inset-x-1.5 top-1 h-3.5 rounded-lg border ${peekClasses[0]}`} />
+      )}
+      <div className="relative flex items-center justify-between gap-2 bg-surface border border-border rounded-lg px-3 py-2.5 group-hover:border-border2 transition-colors">
+        <span className="text-[12px] font-semibold text-text2">{label}</span>
+        <ChevronDown className="w-3.5 h-3.5 text-text3" />
+      </div>
+    </button>
   );
 }
 
@@ -1349,13 +548,14 @@ function NoteCard({ note, onEdit, onDelete, onToggleDone }: NoteCardProps) {
 
   return (
     <div
-      className={`border rounded-lg p-4 ${colorClasses[noteColor as keyof typeof colorClasses]} ${
+      title={note.body ? `${note.title}\n\n${note.body}` : note.title}
+      className={`border rounded-lg p-2.5 ${colorClasses[noteColor as keyof typeof colorClasses]} ${
         note.done ? 'opacity-60' : ''
       }`}
     >
-      <div className="flex items-start justify-between mb-2">
+      <div className="flex items-start justify-between gap-2 mb-1">
         <h3
-          className={`text-[14px] font-bold text-text ${
+          className={`text-[13px] font-bold text-text truncate ${
             note.done ? 'line-through' : ''
           }`}
         >
@@ -1365,12 +565,12 @@ function NoteCard({ note, onEdit, onDelete, onToggleDone }: NoteCardProps) {
           type="checkbox"
           checked={note.done}
           onChange={onToggleDone}
-          className="w-4 h-4 accent-accent cursor-pointer"
+          className="w-4 h-4 accent-accent cursor-pointer flex-shrink-0"
         />
       </div>
-      <p className="text-[12px] text-text2 mb-3 whitespace-pre-wrap">{note.body}</p>
+      {note.body && <p className="text-[11.5px] text-text2 mb-2 line-clamp-2">{note.body}</p>}
       {note.due_date && (
-        <div className="flex items-center gap-1 text-[11px] text-text3 mb-3">
+        <div className="flex items-center gap-1 text-[11px] text-text3 mb-2">
           <Calendar className="w-3 h-3" /> Due: {new Date(note.due_date).toLocaleDateString('en-IN')}
         </div>
       )}
