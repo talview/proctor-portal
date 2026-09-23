@@ -1,29 +1,51 @@
 import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Download, FileDown, CheckCircle2, XCircle, Save, Loader2, UserPlus } from 'lucide-react';
+import { Download, FileDown, CheckCircle2, XCircle, Save, Loader2, UserPlus, Send, Trash2 } from 'lucide-react';
 import { supabase, invokeEdgeFunction } from '@/services/supabase';
 import { useAuthStore } from '@/stores/auth';
-import { usePaginatedQuery } from '@/hooks/usePaginatedQuery';
-import Table from '@/components/ui/Table';
+import { useCursorPaginatedQuery } from '@/hooks/useCursorPaginatedQuery';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
+import { FilterTrigger, FilterChips, type FilterFieldDef } from '@/components/ui/FilterBuilder';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
+import SelectionActionBar, { SelectionAction } from '@/components/ui/SelectionActionBar';
 import ActionMenu from '@/components/ui/ActionMenu';
 import { logAudit } from '@/services/audit';
+import { parseCsv } from '@/lib/csv';
 import { getScopedVendor } from '@/utils/access';
 import { PROCTOR_TYPES } from '@/utils/constants';
-import { useManagedByOptions } from '@/hooks/useManagedByOptions';
+import { useVendorOptions } from '@/hooks/useVendorOptions';
 import { showAlert, showConfirm } from '@/components/ui/GlobalDialog';
 import ClearFiltersButton from '@/components/ui/ClearFiltersButton';
-import BulkActivityDrawer from '@/components/bulk/BulkActivityDrawer';
+import { useUIStore } from '@/stores/ui';
+import DispatchStatusCell from '@/components/ui/DispatchStatusCell';
+import DispatchStatusLegend from '@/components/ui/DispatchStatusLegend';
 import { createBulkDispatch, getActiveDispatchForProctors } from '@/services/bulkDispatch';
 import type { Proctor, InterviewSelectFilters } from '@/types';
+
+// Above this many recipients, confirm before firing a bulk send -- guards against an
+// accidental "select all" rather than any real system limit (the worker already
+// throttles actual sending to 50 items/minute regardless of how many are queued).
+const LARGE_BULK_SEND_THRESHOLD = 100;
+
+// Full literal class strings (Tailwind's JIT scanner can't see `bg-${tone}`-style
+// interpolation) -- same color vocabulary as DispatchStatusCell/Legend: not sent =
+// neutral, shared = accent (matches "Sent"), expired = danger, submitted = success.
+const FORM_STATUS_CHIPS: { label: string; value: string; activeClass: string; dotClass?: string }[] = [
+  { label: 'All Form Status', value: '', activeClass: 'bg-accent/10 text-accent border-transparent' },
+  { label: 'Not Sent', value: 'not_sent', activeClass: 'bg-text3/10 text-text3 border-transparent', dotClass: 'bg-text3' },
+  { label: 'Shared', value: 'shared', activeClass: 'bg-accent/10 text-accent border-transparent', dotClass: 'bg-accent' },
+  { label: 'Expired', value: 'expired', activeClass: 'bg-danger/10 text-danger border-transparent', dotClass: 'bg-danger' },
+  { label: 'Submitted', value: 'submitted', activeClass: 'bg-success/10 text-success border-transparent', dotClass: 'bg-success' },
+];
 
 export default function InterviewSelectsPage() {
   const { user } = useAuthStore();
   const queryClient = useQueryClient();
-  const [filters, setFilters] = useState<InterviewSelectFilters>({ search: '', vendor: '', status: '' });
+  const [filters, setFilters] = useState<InterviewSelectFilters>({ search: '', vendor: '', status: '', ptype: '' });
   const [debouncedSearch, setDebouncedSearch] = useState(filters.search || '');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [editingProctor, setEditingProctor] = useState<Proctor | null>(null);
@@ -34,8 +56,11 @@ export default function InterviewSelectsPage() {
   const [bulkProgress, setBulkProgress] = useState<{ label: string; done: number; total: number } | null>(null);
   const [bulkSummary, setBulkSummary] = useState<{ text: string; tone: 'success' | 'warning' | 'error' } | null>(null);
   const [bulkCreating, setBulkCreating] = useState(false);
-  const [activityDrawer, setActivityDrawer] = useState<{ open: boolean; jobId: string | null }>({ open: false, jobId: null });
-  const [page, setPage] = useState(1);
+  const openBulkActivity = useUIStore((s) => s.openBulkActivity);
+  // Grace window for the "Email: Sending..." poll below -- set the moment a bulk
+  // send is kicked off, so the poll picks up newly-queued items even if nothing was
+  // in flight (and the poll had already stopped) right before the click.
+  const [dispatchedAt, setDispatchedAt] = useState<number | null>(null);
   const PAGE_SIZE = 25;
 
   // Debounce search so typing doesn't fire a request per keystroke now that
@@ -52,27 +77,38 @@ export default function InterviewSelectsPage() {
   const isReadOnly = user?.role === 'coordinator' || isVendor;
   const isAdmin = user?.role === 'admin';
   const scopedVendor = getScopedVendor(user);
-  const { data: managedByOptions = [] } = useManagedByOptions();
-  const managedByValues = new Set(managedByOptions.map((option) => option.value));
+  const { data: vendorOptions = [] } = useVendorOptions();
+  const managedByValues = new Set(vendorOptions.map((option) => option.value));
 
   // 'expired' isn't its own form_status value -- a 'shared' link becomes Expired once
-  // its 24h window passes (see getStatusBadge below), so both the filter and the badge
-  // derive it from form_link_expires_at rather than storing a separate status.
+  // its 24h window passes (see the Form Status column's DispatchStatusCell below), so
+  // both the filter and the badge derive it from form_link_expires_at rather than
+  // storing a separate status.
   const isFormLinkExpired = (p: Proctor) =>
     !!(p.form_link_expires_at && new Date(p.form_link_expires_at) < new Date());
 
-  // Fetch interview selects -- server-side search/filter/pagination via
-  // usePaginatedQuery, mirroring ProctorsPage/AuditLogPage rather than fetching
-  // every interview-select row and filtering/paging in the browser.
-  const { data: pageResult, isLoading, isFetching } = usePaginatedQuery<Proctor>({
-    queryKey: ['interview-selects', user?.vendor, filters.vendor, filters.status],
+  // Fetch interview selects -- server-side search/filter/cursor-pagination via
+  // useCursorPaginatedQuery, mirroring ProctorsPage rather than fetching every
+  // interview-select row and filtering/paging in the browser.
+  const {
+    data: pageData,
+    isLoading,
+    isFetching,
+    hasNextPage,
+    hasPreviousPage,
+    goToNextPage,
+    goToPreviousPage,
+    pageIndex,
+  } = useCursorPaginatedQuery<Proctor>({
+    queryKey: ['interview-selects', user?.vendor, filters.vendor, filters.status, filters.ptype],
     table: 'proctors',
     filters: (q) => {
       let query = q.eq('interview_stage', 'interview_selected');
       // Vendor role sees only their proctors
-      if (scopedVendor) query = query.eq('managed_by', scopedVendor);
-      if (!isVendor && filters.vendor) query = query.eq('managed_by', filters.vendor);
-      // Mirrors getStatusBadge's own derivation below -- 'expired'/'shared' aren't
+      if (scopedVendor) query = query.eq('vendor', scopedVendor);
+      if (!isVendor && filters.vendor) query = query.eq('vendor', filters.vendor);
+      if (filters.ptype) query = query.eq('ptype', filters.ptype);
+      // Mirrors the Form Status column's own derivation below -- 'expired'/'shared' aren't
       // distinguished by a stored column, they're form_status:'shared' whose
       // form_link_expires_at has (or hasn't) passed.
       if (filters.status) {
@@ -91,13 +127,14 @@ export default function InterviewSelectsPage() {
     },
     searchColumns: ['email', 'name'],
     searchTerm: debouncedSearch,
-    page,
     pageSize: PAGE_SIZE,
     orderBy: { column: 'at', ascending: false },
+    resetKey: `${filters.vendor}|${filters.status}|${filters.ptype}`,
+    // Narrowed from select('*') -- verified against the table columns and
+    // EditInterviewSelectModal, which is opened directly with a row from this page
+    // (setEditingProctor(row)), not a separate per-row fetch.
+    select: 'id, email, name, vendor, ptype, notes, interview_stage, form_status, form_link_expires_at, form_shared_at, form_access_count, at',
   });
-
-  const pageData = pageResult?.data ?? [];
-  const totalCount = pageResult?.count ?? 0;
 
   // Existence check for the Add Person modal and the CSV import's duplicate check --
   // both need to see every interview-select record (not just the current page), which
@@ -110,7 +147,7 @@ export default function InterviewSelectsPage() {
     queryKey: ['interview-selects', 'emails', user?.vendor],
     queryFn: async () => {
       let query = supabase.from('proctors').select('email, name').eq('interview_stage', 'interview_selected');
-      if (scopedVendor) query = query.eq('managed_by', scopedVendor);
+      if (scopedVendor) query = query.eq('vendor', scopedVendor);
       const { data, error } = await query;
       if (error) throw error;
       return data as Pick<Proctor, 'email' | 'name'>[];
@@ -218,8 +255,19 @@ export default function InterviewSelectsPage() {
   const { data: activeDispatch } = useQuery({
     queryKey: ['active-dispatch', 'send_pre_onboarding_form', visibleIds],
     queryFn: () => getActiveDispatchForProctors(visibleIds, 'send_pre_onboarding_form'),
-    enabled: visibleIds.length > 0,
-    refetchInterval: 4000,
+    // bulk-dispatch-status is admin-only server-side -- gating here too avoids a
+    // guaranteed-to-fail request on every poll for coordinators/vendors, both of
+    // whom can reach this page (it has no route-level role restriction).
+    enabled: isAdmin && visibleIds.length > 0,
+    // Only keep polling while something's actually in flight, or for 2 minutes right
+    // after a bulk send (items start out 'queued' and briefly show as nothing-active
+    // until the worker picks them up) -- was previously unconditional, polling every
+    // 4s for as long as the tab stayed open regardless of any real activity.
+    refetchInterval: (query) => {
+      const stillActive = (query.state.data?.items ?? []).length > 0;
+      const withinGraceWindow = dispatchedAt !== null && Date.now() - dispatchedAt < 2 * 60_000;
+      return stillActive || withinGraceWindow ? 4000 : false;
+    },
   });
   const activeDispatchByProctor = new Map((activeDispatch?.items ?? []).map((i) => [i.proctor_id, i]));
 
@@ -230,6 +278,13 @@ export default function InterviewSelectsPage() {
   // this request, so it responds in well under a second regardless of selection size.
   const handleBulkSendForm = async () => {
     if (selectedIds.size === 0) return;
+    if (selectedIds.size > LARGE_BULK_SEND_THRESHOLD) {
+      const ok = await showConfirm(
+        `You're about to send the pre-onboarding form to ${selectedIds.size} proctors. Continue?`,
+        { confirmLabel: 'Send' }
+      );
+      if (!ok) return;
+    }
     setBulkCreating(true);
     try {
       const result = await createBulkDispatch('SEND_PRE_ONBOARDING_FORM', Array.from(selectedIds));
@@ -238,7 +293,8 @@ export default function InterviewSelectsPage() {
         tone: result.eligible > 0 ? 'success' : 'warning',
       });
       setSelectedIds(new Set());
-      setActivityDrawer({ open: true, jobId: result.jobId });
+      openBulkActivity(result.jobId);
+      if (result.eligible > 0) setDispatchedAt(Date.now());
       setTimeout(() => setBulkSummary(null), 8000);
     } catch (err: any) {
       showAlert('Failed to start bulk send: ' + err.message, { tone: 'error' });
@@ -272,7 +328,7 @@ export default function InterviewSelectsPage() {
   // Download CSV template
   const downloadTemplate = () => {
     const BOM = '\uFEFF';
-    const header = 'email,proctors,ptype,notes';
+    const header = 'email,vendor,ptype,notes';
     const example = '"john@gmail.com","Sai","ODP","Strong candidate"\n"jane@gmail.com","TSN","WFO",""';
     const blob = new Blob([BOM + header + '\n' + example], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
@@ -292,16 +348,23 @@ export default function InterviewSelectsPage() {
     setCsvProcessing(false);
 
     const text = await file.text();
-    const lines = text.trim().split('\n');
-    
-    if (lines.length < 2) {
+    const parsed = parseCsv(text);
+
+    if (parsed.length < 2) {
       showAlert('File appears empty', { tone: 'error' });
       return;
     }
 
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/"/g, ''));
+    const headers = parsed[0].map((h) => h.toLowerCase());
     const emailIdx = headers.indexOf('email');
-    const vendorIdx = headers.indexOf('proctors') >= 0 ? headers.indexOf('proctors') : headers.indexOf('managed_by');
+    // Accepts the current template's 'vendor' header, plus 'proctors'/'managed_by' for
+    // anyone still using a template downloaded before this was renamed.
+    const vendorIdx =
+      headers.indexOf('vendor') >= 0
+        ? headers.indexOf('vendor')
+        : headers.indexOf('proctors') >= 0
+        ? headers.indexOf('proctors')
+        : headers.indexOf('managed_by');
     const ptypeIdx = headers.indexOf('ptype');
     const notesIdx = headers.indexOf('notes');
 
@@ -317,10 +380,7 @@ export default function InterviewSelectsPage() {
     // looking fine against the DB.
     const seenInFile = new Set<string>();
 
-    const rows = lines.slice(1).map(line => {
-      // Simple CSV parse (handles quoted values)
-      const values = line.match(/(".*?"|[^,]+)(?=\s*,|\s*$)/g)?.map(v => v.replace(/^"|"$/g, '').trim()) || [];
-
+    const rows = parsed.slice(1).map(values => {
       const email = values[emailIdx]?.trim().toLowerCase() || '';
       const vendor = values[vendorIdx]?.trim() || '';
       const ptype = values[ptypeIdx]?.trim() || '';
@@ -395,7 +455,7 @@ export default function InterviewSelectsPage() {
           address: '',
           city: '',
           state: '',
-          dob: '',
+          dob: null,
           gender: '',
           ptype: r.ptype,
           bgv: '',
@@ -417,7 +477,6 @@ export default function InterviewSelectsPage() {
           interview_stage: 'interview_selected',
           form_status: 'not_sent',
           form_link_token: token,
-          managed_by: r.vendor,
           vendor_verified: false,
           vendor_verified_by: '',
           vendor_verified_at: null,
@@ -472,42 +531,44 @@ export default function InterviewSelectsPage() {
     setCsvProcessing(true);
     importMutation.mutate();
   };
-  const getStatusBadge = (row: Proctor) => {
-    if (row.form_status === 'submitted') {
-      return <span className="text-[#166534] bg-[#dcfce7] px-2 py-0.5 rounded text-[11px] font-bold">Submitted</span>;
-    }
-    if (row.form_status === 'shared') {
-      if (isFormLinkExpired(row)) return <span className="text-danger text-[11px] font-bold">Expired</span>;
-      return <span className="text-accent text-[11px] font-bold">Shared</span>;
-    }
-    return <span className="text-text3 text-[11px]">Not Sent</span>;
-  };
 
-  const columns = [
+  const columns: ColumnDef<Proctor, any>[] = [
     {
-      header: (
-        // "Select all" now selects only the current page's rows -- selecting every row
-        // matching the filters across every page would need a separate un-paginated
-        // query, same trade-off ProctorsPage's own header checkbox makes.
+      id: 'select',
+      header: () => (
+        // "Select all" adds/removes only this page's rows from whatever's already
+        // selected, rather than replacing the whole selection -- a bulk send now
+        // correctly covers rows picked on an earlier page too. Selecting every row
+        // matching the filters across every page would still need a separate
+        // un-paginated query, which this doesn't attempt.
         <input
           type="checkbox"
-          checked={pageData.length > 0 && selectedIds.size === pageData.length}
-          onChange={(e) => {
-            setSelectedIds(e.target.checked ? new Set(pageData.map((p) => p.id)) : new Set());
+          checked={pageData.length > 0 && pageData.every((p) => selectedIds.has(p.id))}
+          onChange={() => {
+            const isFullySelected = pageData.length > 0 && pageData.every((p) => selectedIds.has(p.id));
+            setSelectedIds((prev) => {
+              const next = new Set(prev);
+              if (isFullySelected) {
+                pageData.forEach((p) => next.delete(p.id));
+              } else {
+                pageData.forEach((p) => next.add(p.id));
+              }
+              return next;
+            });
           }}
           className="w-4 h-4 accent-accent cursor-pointer"
         />
       ),
-      accessor: (row: Proctor) => (
+      cell: ({ row }) => (
         <input
           type="checkbox"
-          checked={selectedIds.has(row.id)}
+          checked={selectedIds.has(row.original.id)}
           onChange={(e) => {
             const newSet = new Set(selectedIds);
             if (e.target.checked) {
-              newSet.add(row.id);
+              newSet.add(row.original.id);
             } else {
-              newSet.delete(row.id);
+              newSet.delete(row.original.id);
             }
             setSelectedIds(newSet);
           }}
@@ -515,170 +576,173 @@ export default function InterviewSelectsPage() {
           className="w-4 h-4 accent-accent cursor-pointer"
         />
       ),
-      className: 'w-8',
+      enableSorting: false,
+      meta: { className: 'w-8' },
     },
     {
+      id: 'email',
       header: 'Email',
-      accessor: (row: Proctor) => (
+      enableSorting: false,
+      cell: ({ row }) => (
         <div>
-          <div className="text-[13px]">{row.email}</div>
-          <div className="text-[11px] text-text3">{row.name || '—'}</div>
+          <div className="text-[13px]">{row.original.email}</div>
+          <div className="text-[11px] text-text3">{row.original.name || '—'}</div>
         </div>
       ),
     },
     {
+      id: 'vendor',
       header: 'Vendor',
-      accessor: 'managed_by' as keyof Proctor,
+      enableSorting: false,
+      accessorKey: 'vendor',
     },
     {
+      id: 'ptype',
       header: 'Type',
-      accessor: 'ptype' as keyof Proctor,
+      enableSorting: false,
+      accessorKey: 'ptype',
     },
     {
+      id: 'notes',
       header: 'Notes',
-      accessor: (row: Proctor) => (
+      enableSorting: false,
+      cell: ({ row }) => (
         <div className="text-[12px] text-text2 max-w-[200px] truncate">
-          {row.notes || '—'}
+          {row.original.notes || '—'}
         </div>
       ),
     },
     {
-      header: 'Form Status',
-      accessor: (row: Proctor) => {
-        const dispatch = activeDispatchByProctor.get(row.id);
+      id: 'form_status',
+      header: () => (
+        <span className="inline-flex items-center gap-1">
+          Form Status
+          <DispatchStatusLegend />
+        </span>
+      ),
+      enableSorting: false,
+      cell: ({ row }) => (
+        <DispatchStatusCell
+          flow={{
+            completed: row.original.form_status === 'submitted',
+            expired: row.original.form_status === 'shared' && isFormLinkExpired(row.original),
+            viewed: (row.original.form_access_count ?? 0) > 0,
+            lastSucceededAt: row.original.form_shared_at,
+          }}
+          dispatch={activeDispatchByProctor.get(row.original.id)}
+        />
+      ),
+    },
+    {
+      id: 'actions',
+      header: 'Actions',
+      enableSorting: false,
+      cell: ({ row }) => {
+        const proctor = row.original;
         return (
-          <div>
-            {getStatusBadge(row)}
-            {dispatch?.status === 'processing' && (
-              <div className="text-[10px] text-accent mt-0.5">Email: Sending…</div>
+          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+            {!isReadOnly && proctor.form_status !== 'submitted' && (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => sendLinkMutation.mutate(proctor)}
+                disabled={sendLinkMutation.isPending}
+                className="!text-[11px] !px-2 !py-1"
+              >
+                {proctor.form_status === 'shared' ? 'Re-send Form' : 'Send Form'}
+              </Button>
             )}
-            {dispatch?.status === 'failed' && (
-              <div className="text-[10px] text-danger mt-0.5" title={dispatch.failure_reason || ''}>
-                Email: Failed
-              </div>
+            {isAdmin && (
+              <ActionMenu
+                items={[
+                  { label: 'Edit', onClick: () => setEditingProctor(proctor) },
+                  { label: 'Delete', onClick: () => handleDelete(proctor), danger: true },
+                ]}
+              />
             )}
           </div>
         );
       },
     },
-    {
-      header: 'Actions',
-      accessor: (row: Proctor) => (
-        <div className="flex items-center gap-1">
-          {!isReadOnly && row.form_status !== 'submitted' && (
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => sendLinkMutation.mutate(row)}
-              disabled={sendLinkMutation.isPending}
-              className="!text-[11px] !px-2 !py-1"
-            >
-              {row.form_status === 'shared' ? 'Re-send Form' : 'Send Form'}
-            </Button>
-          )}
-          {isAdmin && (
-            <ActionMenu
-              items={[
-                { label: 'Edit', onClick: () => setEditingProctor(row) },
-                { label: 'Delete', onClick: () => handleDelete(row), danger: true },
-              ]}
-            />
-          )}
-        </div>
-      ),
-    },
   ];
+
+  // Form Status used to be its own always-visible chip row; now it's just another
+  // field behind the same "Add Filter" builder as Vendor/Type, so the filter row
+  // stays short and consistent with Proctors/Scheduled Events.
+  const interviewFilterFields: FilterFieldDef[] = [
+    { key: 'status', label: 'Form Status', options: FORM_STATUS_CHIPS.filter((c) => c.value).map((c) => ({ value: c.value, label: c.label })) },
+    { key: 'ptype', label: 'Type', options: PROCTOR_TYPES.map((t) => ({ value: t, label: t })) },
+    ...(!isVendor ? [{ key: 'vendor', label: 'Vendor', options: vendorOptions } as FilterFieldDef] : []),
+  ];
+  const interviewFilterValues = { status: filters.status || '', ptype: filters.ptype || '', vendor: filters.vendor || '' };
+  const handleInterviewFilterChange = (key: string, value: string) => setFilters({ ...filters, [key]: value } as any);
 
   return (
     <div>
-      {/* Filters */}
-      <div className="bg-surface border border-border rounded-lg p-4 mb-6">
-        <div className="flex flex-wrap gap-3 items-end">
-          <div className="flex-1 min-w-[200px]">
-            <Input
-              placeholder="Search name, email..."
-              value={filters.search}
-              onChange={(e) => {
-                setFilters({ ...filters, search: e.target.value });
-                setPage(1);
-              }}
-            />
-          </div>
-
-          {!isVendor && (
-            <Select
-              options={[
-                { value: '', label: 'All Vendors' },
-                ...managedByOptions,
-              ]}
-              value={filters.vendor}
-              onChange={(e) => {
-                setFilters({ ...filters, vendor: e.target.value as any });
-                setPage(1);
-              }}
-              wrapperClassName="min-w-[160px]"
-            />
-          )}
-
-          <Select
-            options={[
-              { value: '', label: 'All Form Status' },
-              { value: 'not_sent', label: 'Not Sent' },
-              { value: 'shared', label: 'Shared' },
-              { value: 'expired', label: 'Expired' },
-              { value: 'submitted', label: 'Submitted' },
-            ]}
-            value={filters.status}
-            onChange={(e) => {
-              setFilters({ ...filters, status: e.target.value as any });
-              setPage(1);
-            }}
-            wrapperClassName="min-w-[160px]"
+      {/* Filters -- flat row, no card wrapper (matches Proctors). Form Status/Type/
+          Vendor all live behind one "Add Filter" builder, with applied chips on
+          their own row below so adding one never reflows this row. */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <Input
+            placeholder="Search name, email..."
+            value={filters.search}
+            onChange={(e) => setFilters({ ...filters, search: e.target.value })}
+            wrapperClassName="w-[220px]"
           />
+
+          <FilterTrigger fields={interviewFilterFields} values={interviewFilterValues} onChange={handleInterviewFilterChange} />
 
           <ClearFiltersButton
-            show={!!(filters.search || filters.vendor || filters.status)}
-            onClick={() => {
-              setFilters({ search: '', vendor: '', status: '' });
-              setPage(1);
-            }}
+            show={!!(filters.search || filters.vendor || filters.status || filters.ptype)}
+            onClick={() => setFilters({ search: '', vendor: '', status: '', ptype: '' })}
           />
+        </div>
 
-          <div className="flex items-center gap-2 ml-auto">
-            {!isVendor && (
-              <Button variant="ghost" size="sm" onClick={() => setActivityDrawer({ open: true, jobId: null })}>
-                Bulk Activity
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {!isReadOnly && (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowAddPerson(true)}
+              >
+                <UserPlus className="w-3.5 h-3.5" /> Add
               </Button>
-            )}
-            {!isReadOnly && (
-              <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowAddPerson(true)}
-                >
-                  <UserPlus className="w-3.5 h-3.5" /> Add
-                </Button>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => setShowImport(true)}
-                >
-                  <FileDown className="w-3.5 h-3.5" /> Import CSV
-                </Button>
-              </>
-            )}
-          </div>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => setShowImport(true)}
+              >
+                <FileDown className="w-3.5 h-3.5" /> Import CSV
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
+      <div className="mb-3">
+        <FilterChips fields={interviewFilterFields} values={interviewFilterValues} onChange={handleInterviewFilterChange} />
+      </div>
+
       {/* Table */}
-      <Table
+      <DataTable
         data={pageData}
         columns={columns}
         isLoading={isLoading}
+        // Matches the Edit action's own gating below -- only admin can edit an
+        // interview select at all, so the row itself is only clickable for admin.
+        onRowClick={isAdmin ? setEditingProctor : undefined}
         emptyMessage="No interview selects — import a CSV to get started"
-        pagination={{ page, pageSize: PAGE_SIZE, count: totalCount, isFetching, onPageChange: setPage }}
+        pagination={{
+          pageIndex,
+          pageSize: PAGE_SIZE,
+          hasNextPage,
+          hasPreviousPage,
+          isFetching,
+          onNext: goToNextPage,
+          onPrevious: goToPreviousPage,
+        }}
       />
 
       {(bulkProgress || bulkSummary) && (
@@ -711,32 +775,27 @@ export default function InterviewSelectsPage() {
       )}
 
       {selectedIds.size > 0 && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[1100] bg-surface border border-border rounded-full shadow-lg px-4 py-2 flex items-center gap-2">
-          <span className="text-xs font-semibold text-text px-2">{selectedIds.size} selected</span>
+        <SelectionActionBar count={selectedIds.size} onClear={() => setSelectedIds(new Set())}>
           {!isReadOnly && (
-            <Button variant="primary" size="sm" onClick={handleBulkSendForm} disabled={!!bulkProgress || bulkCreating}>
-              {bulkCreating ? 'Starting…' : 'Send Form'}
-            </Button>
+            <SelectionAction
+              icon={Send}
+              label={bulkCreating ? 'Starting…' : 'Send Form'}
+              onClick={handleBulkSendForm}
+              disabled={!!bulkProgress || bulkCreating}
+            />
           )}
           {isAdmin && (
-            <Button variant="danger" size="sm" onClick={handleBulkDelete} disabled={!!bulkProgress}>
-              Delete
-            </Button>
+            <SelectionAction
+              icon={Trash2}
+              iconClassName="text-danger"
+              label="Delete"
+              onClick={handleBulkDelete}
+              disabled={!!bulkProgress}
+            />
           )}
-          <button
-            className="text-text3 hover:text-text text-xs px-2"
-            onClick={() => setSelectedIds(new Set())}
-          >
-            Clear
-          </button>
-        </div>
+        </SelectionActionBar>
       )}
 
-      <BulkActivityDrawer
-        isOpen={activityDrawer.open}
-        onClose={() => setActivityDrawer({ open: false, jobId: null })}
-        initialJobId={activityDrawer.jobId}
-      />
 
       {/* Edit Modal */}
       {editingProctor && (
@@ -832,28 +891,31 @@ export default function InterviewSelectsPage() {
                   </div>
                 )}
 
-                <Table
+                <DataTable
                   data={csvData}
                   columns={[
-                    { header: 'Email', accessor: (row: any) => row.email },
-                    { header: 'Vendor', accessor: (row: any) => row.vendor },
-                    { header: 'Type', accessor: (row: any) => row.ptype },
+                    { id: 'email', header: 'Email', enableSorting: false, cell: ({ row }) => row.original.email },
+                    { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original.vendor },
+                    { id: 'ptype', header: 'Type', enableSorting: false, cell: ({ row }) => row.original.ptype },
                     {
+                      id: 'status',
                       header: 'Status',
-                      accessor: (row: any) =>
-                        row._result === 'success' ? (
+                      enableSorting: false,
+                      cell: ({ row }) => {
+                        const csvRow = row.original;
+                        return csvRow._result === 'success' ? (
                           <span className="inline-flex items-center gap-1 text-success text-[10px] font-bold">
                             <CheckCircle2 className="w-3 h-3" /> Imported
                           </span>
-                        ) : row._result === 'failed' ? (
-                          <span className="inline-flex items-center gap-1 text-danger text-[10px] font-bold" title={row._resultError}>
-                            <XCircle className="w-3 h-3" /> Failed — {row._resultError}
+                        ) : csvRow._result === 'failed' ? (
+                          <span className="inline-flex items-center gap-1 text-danger text-[10px] font-bold" title={csvRow._resultError}>
+                            <XCircle className="w-3 h-3" /> Failed — {csvRow._resultError}
                           </span>
-                        ) : row._ok && csvProcessing ? (
+                        ) : csvRow._ok && csvProcessing ? (
                           <span className="inline-flex items-center gap-1 text-text3 text-[10px] font-bold">
                             <Loader2 className="w-3 h-3 animate-spin" /> Importing...
                           </span>
-                        ) : row._ok ? (
+                        ) : csvRow._ok ? (
                           <span className="inline-flex items-center gap-1 text-success text-[10px] font-bold">
                             <CheckCircle2 className="w-3 h-3" /> OK
                           </span>
@@ -861,9 +923,10 @@ export default function InterviewSelectsPage() {
                           <span className="inline-flex items-center gap-1 text-danger text-[10px] font-bold">
                             <XCircle className="w-3 h-3" /> Error
                           </span>
-                        ),
+                        );
+                      },
                     },
-                  ]}
+                  ] satisfies ColumnDef<any, any>[]}
                 />
 
                 <div className="flex gap-2 mt-4">
@@ -905,11 +968,11 @@ interface EditInterviewSelectModalProps {
 
 function EditInterviewSelectModal({ proctor, onClose, onSuccess }: EditInterviewSelectModalProps) {
   const [email, setEmail] = useState(proctor.email || '');
-  const [vendor, setVendor] = useState(proctor.vendor || proctor.managed_by || '');
+  const [vendor, setVendor] = useState(proctor.vendor || '');
   const [ptype, setPtype] = useState(proctor.ptype || '');
   const [notes, setNotes] = useState(proctor.notes || '');
   const [emailError, setEmailError] = useState('');
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
 
   // Validate email on change
   const validateEmail = (value: string) => {
@@ -956,7 +1019,6 @@ function EditInterviewSelectModal({ proctor, onClose, onSuccess }: EditInterview
         .update({
           email: trimmedEmail,
           vendor,
-          managed_by: vendor, // Update both vendor and managed_by
           ptype,
           notes,
           upd: new Date().toISOString(),
@@ -1007,10 +1069,10 @@ function EditInterviewSelectModal({ proctor, onClose, onSuccess }: EditInterview
             <Select
               options={[
                 { value: '', label: 'Select...' },
-                ...managedByOptions,
+                ...vendorOptions,
               ]}
               value={vendor}
-              onChange={(e) => setVendor(e.target.value)}
+              onChange={(e) => setVendor(e.target.value as Proctor['vendor'])}
             />
           </div>
 
@@ -1076,7 +1138,7 @@ function AddInterviewSelectModal({ existing, onClose, onSuccess }: AddInterviewS
   const [ptype, setPtype] = useState('');
   const [notes, setNotes] = useState('');
   const [emailError, setEmailError] = useState('');
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
   const scopedVendor = getScopedVendor(user);
 
   const saveMutation = useMutation({
@@ -1103,7 +1165,7 @@ function AddInterviewSelectModal({ existing, onClose, onSuccess }: AddInterviewS
         address: '',
         city: '',
         state: '',
-        dob: '',
+        dob: null,
         gender: '',
         ptype,
         bgv: '',
@@ -1125,7 +1187,6 @@ function AddInterviewSelectModal({ existing, onClose, onSuccess }: AddInterviewS
         interview_stage: 'interview_selected',
         form_status: 'not_sent',
         form_link_token: token,
-        managed_by: vendor,
         vendor_verified: false,
         vendor_verified_by: '',
         vendor_verified_at: null,
@@ -1191,7 +1252,7 @@ function AddInterviewSelectModal({ existing, onClose, onSuccess }: AddInterviewS
             <Select
               options={[
                 { value: '', label: 'Select...' },
-                ...managedByOptions,
+                ...vendorOptions,
               ]}
               value={vendor || scopedVendor || ''}
               onChange={(e) => setVendor(e.target.value)}

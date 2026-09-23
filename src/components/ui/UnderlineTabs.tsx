@@ -20,7 +20,7 @@ export default function UnderlineTabs({
   onChange: (value: any) => void;
 }) {
   return (
-    <div role="tablist" className="flex gap-2 border-b border-border overflow-x-auto">
+    <div role="tablist" className="flex gap-1 border-b border-border overflow-x-auto">
       {options.map((opt) => {
         const Icon = opt.icon;
         const active = opt.value === value;
@@ -30,7 +30,7 @@ export default function UnderlineTabs({
             role="tab"
             aria-selected={active}
             onClick={() => onChange(opt.value)}
-            className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px flex-shrink-0 whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-2.5 py-2 text-sm font-medium border-b-2 transition-colors -mb-px flex-shrink-0 whitespace-nowrap ${
               active ? 'text-accent border-accent' : 'text-text3 border-transparent hover:text-text'
             }`}
           >

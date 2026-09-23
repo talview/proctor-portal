@@ -3,8 +3,12 @@ import { proctorService } from '@/services/proctor';
 import { useAuthStore } from '@/stores/auth';
 import { supabase } from '@/services/supabase';
 import { getScopedVendor } from '@/utils/access';
-import Table from '@/components/ui/Table';
+import { formatRelativeTime } from '@/utils/formatters';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
+import EmptyState from '@/components/ui/EmptyState';
+import { Activity } from 'lucide-react';
 
 export default function DashboardPage() {
   const { user } = useAuthStore();
@@ -20,21 +24,20 @@ export default function DashboardPage() {
     queryFn: async () => {
       let query = supabase
         .from('proctors')
-        .select('id, name, managed_by, vendor, status, upd, interview_stage')
+        .select('id, name, vendor, status, upd, interview_stage')
         .order('upd', { ascending: false })
         .limit(20); // Fetch more to filter
 
       const scopedVendor = getScopedVendor(user);
       if (scopedVendor) {
-        query = query.or(`vendor.eq."${scopedVendor}",managed_by.eq."${scopedVendor}"`);
+        query = query.eq('vendor', scopedVendor);
       }
 
       const { data, error } = await query;
       if (error) throw error;
 
-      // Map vendor field and filter out interview_selected like HTML app
+      // Filter out interview_selected like HTML app
       const filtered = (data || [])
-        .map(p => ({ ...p, vendor: p.vendor || p.managed_by }))
         .filter(p => p.interview_stage !== 'interview_selected')
         .slice(0, 8);
       
@@ -53,25 +56,16 @@ export default function DashboardPage() {
     );
   }
 
-  const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-  };
-
-  const getStatusBadge = (status: string) => {
-    const colors: Record<string, string> = {
-      'In Progress': 'bg-warning/10 text-warning',
-      'Verified': 'bg-info/10 text-info',
-      'Active': 'bg-success/10 text-success',
-      'Offboarded': 'bg-danger/10 text-danger',
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[11px] font-semibold ${colors[status] || 'bg-surface2 text-text3'}`}>
-        {status}
-      </span>
-    );
-  };
-
+  // get_proctor_stats already returns every stage's count directly (already
+  // scoped to the current vendor for a coordinator/vendor view) -- no separate
+  // query needed to drive this funnel.
+  const funnelStages = [
+    { label: 'In Progress', value: stats?.inProgress || 0, tone: 'info' },
+    { label: 'Verified', value: stats?.verified || 0, tone: 'warning' },
+    { label: 'Active', value: stats?.active || 0, tone: 'success' },
+    { label: 'Offboarded', value: stats?.offboarded || 0, tone: 'neutral' },
+  ];
+  const funnelTotal = funnelStages.reduce((sum, s) => sum + s.value, 0) || 1;
 
   return (
     <div>
@@ -125,41 +119,96 @@ export default function DashboardPage() {
           <h3 className="text-xs font-semibold text-text3 uppercase tracking-wide mb-3 pb-2 border-b border-border">
             Vendor Breakdown
           </h3>
-          <Table
+          <DataTable
             data={Object.entries(stats?.byVendor || {}).map(([vendor, data]: [string, any]) => ({ vendor, ...data }))}
             columns={[
-              { header: 'Vendor', accessor: (row) => row.vendor, className: 'text-[13px] font-semibold text-text' },
-              { header: 'Total', accessor: (row) => row.total, className: 'text-right font-mono text-sm text-text', headerClassName: 'text-right' },
-              { header: 'In Progress', accessor: (row) => row.inProgress, className: 'text-right font-mono text-sm text-warning', headerClassName: 'text-right' },
-              { header: 'Active', accessor: (row) => row.active, className: 'text-right font-mono text-sm text-success', headerClassName: 'text-right' },
-              { header: 'BGV Missing', accessor: (row) => row.bgvMissing, className: 'text-right font-mono text-sm text-warning', headerClassName: 'text-right' },
-              { header: 'BGV Overdue', accessor: (row) => row.bgvOverdue, className: 'text-right font-mono text-sm text-danger', headerClassName: 'text-right' },
-              { header: 'Demo Cert', accessor: (row) => row.demoCert, className: 'text-right font-mono text-sm text-[#7c3aed]', headerClassName: 'text-right' },
-              { header: 'Assess Cert', accessor: (row) => row.assessCert, className: 'text-right font-mono text-sm text-accent', headerClassName: 'text-right' },
-            ]}
+              { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original.vendor, meta: { className: 'text-[13px] font-semibold text-text' } },
+              { id: 'total', header: 'Total', enableSorting: false, cell: ({ row }) => row.original.total, meta: { className: 'text-right font-display tabular-nums text-sm text-text', headerClassName: 'text-right' } },
+              { id: 'inProgress', header: 'In Progress', enableSorting: false, cell: ({ row }) => row.original.inProgress, meta: { className: 'text-right font-display tabular-nums text-sm text-warning', headerClassName: 'text-right' } },
+              { id: 'active', header: 'Active', enableSorting: false, cell: ({ row }) => row.original.active, meta: { className: 'text-right font-display tabular-nums text-sm text-success', headerClassName: 'text-right' } },
+              { id: 'bgvMissing', header: 'BGV Missing', enableSorting: false, cell: ({ row }) => row.original.bgvMissing, meta: { className: 'text-right font-display tabular-nums text-sm text-warning', headerClassName: 'text-right' } },
+              { id: 'bgvOverdue', header: 'BGV Overdue', enableSorting: false, cell: ({ row }) => row.original.bgvOverdue, meta: { className: 'text-right font-display tabular-nums text-sm text-danger', headerClassName: 'text-right' } },
+              { id: 'demoCert', header: 'Demo Cert', enableSorting: false, cell: ({ row }) => row.original.demoCert, meta: { className: 'text-right font-display tabular-nums text-sm text-[#7c3aed]', headerClassName: 'text-right' } },
+              { id: 'assessCert', header: 'Assess Cert', enableSorting: false, cell: ({ row }) => row.original.assessCert, meta: { className: 'text-right font-display tabular-nums text-sm text-accent', headerClassName: 'text-right' } },
+            ] satisfies ColumnDef<any, any>[]}
           />
         </div>
       )}
 
-      {/* Recent Activity */}
-      <div>
-        <h3 className="text-xs font-semibold text-text3 uppercase tracking-wide mb-3">
-          Recent Activity
-        </h3>
-        <Table
-          data={recentActivity}
-          emptyMessage="No activity yet"
-          columns={[
-            { header: 'Name', accessor: (p: any) => p.name, className: 'text-[13px] font-semibold text-text' },
-            { header: 'Vendor', accessor: (p: any) => p.vendor || p.managed_by || '—', className: 'text-[12px] text-text2 font-medium' },
-            { header: 'Status', accessor: (p: any) => getStatusBadge(p.status) },
-            { header: 'Updated', accessor: (p: any) => formatDate(p.upd), className: 'text-[12px] text-text3' },
-          ]}
-        />
+      {/* Workforce by stage (funnel) + Recent activity (feed) -- a pipeline
+          breakdown paired with a compact live-ish feed, replacing the old plain
+          "Recent Activity" table. */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1.5fr_1fr] gap-4">
+        <div className="bg-surface border border-border rounded-lg p-4">
+          <h3 className="text-xs font-semibold text-text3 uppercase tracking-wide mb-4">
+            Workforce by Stage
+          </h3>
+          <div className="space-y-3.5">
+            {funnelStages.map((stage) => (
+              <div key={stage.label} className="flex items-center gap-3">
+                <div className="w-[92px] flex-shrink-0 text-[12px] font-semibold text-text2">{stage.label}</div>
+                <div className="flex-1 h-2.5 bg-surface2 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${STAGE_BAR_CLASS[stage.tone]}`}
+                    style={{ width: `${Math.round((stage.value / funnelTotal) * 100)}%` }}
+                  />
+                </div>
+                <div className="w-14 flex-shrink-0 text-right text-[12px] font-display font-bold tabular-nums text-text">{stage.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-surface border border-border rounded-lg p-4">
+          <h3 className="text-xs font-semibold text-text3 uppercase tracking-wide mb-4">
+            Recent Activity
+          </h3>
+          {recentActivity.length === 0 ? (
+            <EmptyState icon={Activity} title="No activity yet" compact />
+          ) : (
+            <div className="divide-y divide-border">
+              {recentActivity.map((row: any) => (
+                <div key={row.id} className="flex items-start gap-2.5 py-2.5 first:pt-0 last:pb-0">
+                  <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0 ${STAGE_DOT_CLASS[STATUS_TONE[row.status] || 'neutral']}`} />
+                  <div className="min-w-0">
+                    <div className="text-[12px] text-text2 leading-relaxed">
+                      <span className="font-semibold text-text">{row.name}</span> — {row.status}
+                      {row.vendor ? ` · ${row.vendor}` : ''}
+                    </div>
+                    <div className="text-[10.5px] text-text3 mt-0.5">{formatRelativeTime(row.upd)}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
+
+// Matches the "Proctor OS" reference artifact's own tone mapping -- see Badge.tsx
+// for the same mapping applied to the actual status pills.
+const STATUS_TONE: Record<string, string> = {
+  'In Progress': 'info',
+  'Verified': 'warning',
+  'Active': 'success',
+  'Offboarded': 'neutral',
+};
+const STAGE_BAR_CLASS: Record<string, string> = {
+  warning: 'bg-warning',
+  info: 'bg-info',
+  success: 'bg-success',
+  danger: 'bg-danger',
+  neutral: 'bg-text3',
+};
+const STAGE_DOT_CLASS: Record<string, string> = {
+  warning: 'bg-warning',
+  info: 'bg-info',
+  success: 'bg-success',
+  danger: 'bg-danger',
+  neutral: 'bg-text3',
+};
 
 interface StatCardProps {
   label: string;
@@ -177,7 +226,7 @@ function StatCard({ label, value, subtitle, valueColor = 'text-text', className 
       <div className="text-[11px] font-semibold text-text3 uppercase tracking-wide mb-2">
         {label}
       </div>
-      <div className={`text-[28px] font-bold font-mono leading-none ${valueColor}`}>
+      <div className={`text-[23px] font-display font-bold tabular-nums leading-none ${valueColor}`}>
         {value}
       </div>
       {subtitle && (

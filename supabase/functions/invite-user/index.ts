@@ -47,8 +47,9 @@ serve(async (req) => {
       throw new Error('Only admins can create users')
     }
 
-    const { email, role, vendorId, mode, password: suppliedPassword } = await req.json()
+    const { name, email, role, vendorId, mode, password: suppliedPassword } = await req.json()
 
+    if (!name || !name.trim()) throw new Error('A name is required')
     if (!email || !email.includes('@')) throw new Error('A valid email is required')
     if (!VALID_ROLES.includes(role)) throw new Error('Invalid role')
     if (role === 'vendor' && !vendorId) throw new Error('vendorId is required for vendor role')
@@ -147,7 +148,9 @@ Sent automatically by Talview Proctor Portal.`
         // duplicate. Say so explicitly so an admin isn't left unsure whether retrying
         // will make things worse.
         const reason = emailError instanceof Error ? emailError.message : 'Unknown error'
-        throw new Error(`Invite email failed to send (${reason}). You can safely try again with the same email.`)
+        throw new Error(`Invite email failed to send (${reason}). You can safely try again with the same email.`, {
+          cause: emailError,
+        })
       }
     } else {
       const passwordToUse = suppliedPassword || crypto.randomUUID().replace(/-/g, '').slice(0, 20)
@@ -165,9 +168,15 @@ Sent automatically by Talview Proctor Portal.`
       id: authUserId,
       username: email.split('@')[0],
       email,
+      name: name.trim(),
       role,
       vendor_id: role === 'vendor' ? vendorId : null,
       password: '',
+      // mode: 'invite' already forces a fresh, self-chosen password via
+      // AcceptInvitePage before the account is usable -- only mode: 'password'
+      // hands out a temp credential the admin has seen, so only that path
+      // needs to force a change on first login.
+      must_change_password: mode === 'password',
     })
     if (insertError) throw insertError
 

@@ -1,15 +1,15 @@
 import { useQuery } from '@tanstack/react-query';
 import { supabase } from '@/services/supabase';
 
-export interface ManagedByOption {
+export interface VendorOption {
   value: string;
   label: string;
 }
 
-export function useManagedByOptions() {
+export function useVendorOptions() {
   return useQuery({
-    queryKey: ['managed-by-options'],
-    queryFn: async (): Promise<ManagedByOption[]> => {
+    queryKey: ['vendor-options'],
+    queryFn: async (): Promise<VendorOption[]> => {
       const { data, error } = await supabase
         .from('vendors')
         .select('name, active')

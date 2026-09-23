@@ -104,6 +104,19 @@ export async function requireAdminCaller(req: Request, supabase: ReturnType<type
   return { id: callerData.user.id, ...callerProfile }
 }
 
+// A durable-job worker call (e.g. nda-jobs-worker logging 'signed_pdf_generated')
+// has no Request of its own to pull IP/UA from -- the signer's real request ended
+// long before the job ran. Passing the pre-extracted values captured back when the
+// signer's own request was live (see nda-session-submit's handleSign) keeps the
+// audit trail's IP real instead of always reading "unknown".
+type ReqOrCapturedIp = Request | { ip: string | null; userAgent: string | null } | null
+
+function resolveIpUa(req: ReqOrCapturedIp): { ip: string | null; userAgent: string | null } {
+  if (!req) return { ip: null, userAgent: null }
+  if (req instanceof Request) return { ip: getClientIp(req), userAgent: getUserAgent(req) }
+  return req
+}
+
 /**
  * Appends any number of events to the append-only audit log in a single DB
  * round-trip via `log_nda_events_batch` (server-side computes the next `seq`
@@ -113,14 +126,15 @@ export async function requireAdminCaller(req: Request, supabase: ReturnType<type
 export async function logEventsBatch(
   supabase: ReturnType<typeof adminClient>,
   sessionId: string,
-  req: Request | null,
+  req: ReqOrCapturedIp,
   events: { eventType: string; detail?: Record<string, unknown> }[]
 ) {
   if (events.length === 0) return
+  const { ip, userAgent } = resolveIpUa(req)
   const { error } = await supabase.rpc('log_nda_events_batch', {
     p_session_id: sessionId,
-    p_ip_address: req ? getClientIp(req) : null,
-    p_user_agent: req ? getUserAgent(req) : null,
+    p_ip_address: ip,
+    p_user_agent: userAgent,
     p_events: events.map((e) => ({ event_type: e.eventType, detail: e.detail ?? {} })),
   })
   if (error) throw error
@@ -131,7 +145,7 @@ export async function logEvent(
   supabase: ReturnType<typeof adminClient>,
   sessionId: string,
   eventType: string,
-  req: Request | null,
+  req: ReqOrCapturedIp,
   detail: Record<string, unknown> = {}
 ) {
   await logEventsBatch(supabase, sessionId, req, [{ eventType, detail }])
@@ -158,44 +172,80 @@ export async function casUpdate(
   return (data?.length ?? 0) > 0
 }
 
+// 429 (rate-limited) and 5xx (Mailgun-side trouble) are worth a quick retry -- a burst
+// of sends (e.g. 200 candidates requesting an OTP in the same minute) is exactly the
+// case transient provider pressure shows up. A 4xx other than 429 (bad recipient,
+// bad request) never gets more likely to succeed by retrying, so those still throw
+// immediately, same as before this change -- every caller (send-otp, nda-session-
+// send-otp, and both bulk-dispatch paths via _shared/dispatch.ts) gets this for free,
+// no call-site changes needed.
+const MAILGUN_MAX_ATTEMPTS = 3
+const MAILGUN_BASE_DELAY_MS = 500
+
+function isRetryableMailgunStatus(status: number): boolean {
+  return status === 429 || status >= 500
+}
+
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 export async function sendMailgunEmail(to: string, subject: string, html: string, text: string) {
   const mailgunDomain = Deno.env.get('MAILGUN_DOMAIN')
   const mailgunApiKey = Deno.env.get('MAILGUN_API_KEY')
   if (!mailgunDomain || !mailgunApiKey) throw new Error('Mailgun not configured')
 
-  const formData = new FormData()
-  formData.append('from', `Talview Proctor Portal <noreply@${mailgunDomain}>`)
-  formData.append('to', to)
-  formData.append('subject', subject)
-  formData.append('html', html)
-  formData.append('text', text)
-  formData.append('o:tracking-opens', 'no')
-  formData.append('o:tracking-clicks', 'no')
-
   const replyTo = Deno.env.get('MAILGUN_REPLY_TO')
-  if (replyTo) formData.append('h:Reply-To', replyTo)
 
-  const res = await fetch(`https://api.mailgun.net/v3/${mailgunDomain}/messages`, {
-    method: 'POST',
-    headers: { Authorization: `Basic ${btoa(`api:${mailgunApiKey}`)}` },
-    body: formData,
-  })
+  // FormData can only be read once per fetch -- build a fresh one each attempt rather
+  // than trying to reuse a consumed body across retries.
+  const buildFormData = () => {
+    const formData = new FormData()
+    formData.append('from', `Talview Proctor Portal <noreply@${mailgunDomain}>`)
+    formData.append('to', to)
+    formData.append('subject', subject)
+    formData.append('html', html)
+    formData.append('text', text)
+    formData.append('o:tracking-opens', 'no')
+    formData.append('o:tracking-clicks', 'no')
+    if (replyTo) formData.append('h:Reply-To', replyTo)
+    return formData
+  }
 
-  if (!res.ok) {
+  let lastReason: string
+  for (let attempt = 0; attempt < MAILGUN_MAX_ATTEMPTS; attempt++) {
+    const res = await fetch(`https://api.mailgun.net/v3/${mailgunDomain}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${btoa(`api:${mailgunApiKey}`)}` },
+      body: buildFormData(),
+    })
+
+    if (res.ok) return
+
     const errorText = await res.text()
-    console.error('Mailgun error:', errorText)
+    console.error(`Mailgun error (attempt ${attempt + 1}/${MAILGUN_MAX_ATTEMPTS}):`, errorText)
     // Surface Mailgun's actual reason (e.g. a daily send-limit or an invalid recipient)
     // rather than a fixed generic string -- this is what ends up in
     // bulk_dispatch_items.failure_reason, and a generic message there gives an admin no
     // way to tell "retry this" apart from "this will never succeed until tomorrow."
-    let reason = `Mailgun error (${res.status})`
+    lastReason = `Mailgun error (${res.status})`
     try {
       const parsed = JSON.parse(errorText)
-      if (parsed?.message) reason = parsed.message
+      if (parsed?.message) lastReason = parsed.message
     } catch {
       // errorText wasn't JSON -- keep the generic status-coded reason above
     }
-    throw new Error(reason)
+
+    const isLastAttempt = attempt === MAILGUN_MAX_ATTEMPTS - 1
+    if (!isRetryableMailgunStatus(res.status) || isLastAttempt) {
+      throw new Error(lastReason)
+    }
+
+    // Exponential backoff with full jitter: base * 2^attempt, picked uniformly from
+    // [0, that] -- spreads out a burst of retries instead of having them all collide
+    // again on the next fixed interval.
+    const maxDelay = MAILGUN_BASE_DELAY_MS * 2 ** attempt
+    await sleep(Math.random() * maxDelay)
   }
 }
 

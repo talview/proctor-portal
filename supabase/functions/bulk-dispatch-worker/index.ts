@@ -143,6 +143,17 @@ serve(async (req) => {
       // Cron calls with an empty body -- draining across any job is the default.
     }
 
+    // A crashed worker can leave items claimed ('processing') but never finished --
+    // reclaim anything stuck for more than 5 minutes before claiming fresh work.
+    // recompute_bulk_job_progress must run for every job this touches: a job whose
+    // last processing item just got reclaimed to 'queued' or 'failed' otherwise keeps
+    // reading status:'processing' forever, since that's the only thing that ever
+    // flips it.
+    const { data: reclaimedJobIds } = await supabase.rpc('reclaim_stale_bulk_dispatch_items')
+    for (const id of reclaimedJobIds || []) {
+      await supabase.rpc('recompute_bulk_job_progress', { p_job_id: id })
+    }
+
     const startedAt = Date.now()
     let totalClaimed = 0
     while (Date.now() - startedAt < TIME_BUDGET_MS) {

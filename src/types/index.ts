@@ -29,6 +29,10 @@ export interface User {
   vendor?: Vendor;
   created_at: string;
   updated_at: string;
+  /** True for an admin-issued temp password ('Set password directly' mode)
+   * that's never been changed yet -- gates the whole app behind
+   * ChangePasswordPage until cleared. */
+  mustChangePassword: boolean;
 }
 
 export interface Proctor {
@@ -36,13 +40,12 @@ export interface Proctor {
   pid?: string;
   name: string;
   aadhaar: string;
-  vendor?: string; // Used in HTML app (same as managed_by)
   phone: string;
   email: string;
   address?: string;
   city: string;
   state: string;
-  dob: string;
+  dob: string | null;
   gender: 'Male' | 'Female' | 'Other';
   ptype: ProctorType;
   bgv?: string;
@@ -77,7 +80,11 @@ export interface Proctor {
   nda_link_expires_at?: string | null;
   nda_signed_at?: string | null;
   nda_file_url?: string;
-  
+  /** First time this proctor's onboarding-docs NDA was actually opened (a real
+   * nda_viewed event, not just a link having been sent) -- set once by a trigger,
+   * never overwritten by later views. */
+  nda_viewed_at?: string | null;
+
   // Interview select / onboarding form fields
   interview_stage?: string;
   form_status?: string;
@@ -85,7 +92,10 @@ export interface Proctor {
   form_shared_at?: string | null;
   form_submitted_at?: string | null;
   form_link_expires_at?: string | null;
-  managed_by: Vendor;
+  /** Incremented on every OTP request for the pre-onboarding form link (send-otp) --
+   * the same "did they actually open it" signal nda_viewed_at is for the docs flow. */
+  form_access_count?: number;
+  vendor: Vendor;
   vendor_verified?: boolean;
   vendor_verified_by?: string;
   vendor_verified_at?: string | null;
@@ -100,7 +110,7 @@ export interface Proctor {
 export interface InterviewSelect {
   id: string;
   email: string;
-  managed_by: Vendor;
+  vendor: Vendor;
   ptype: ProctorType;
   notes?: string;
   form_status: 'not_sent' | 'shared' | 'submitted';
@@ -185,6 +195,10 @@ export interface ProctorFilters {
   /** Derived from final_form_status + nda_link_expires_at, not a stored column value
    * on its own -- see the Documents column's badge logic in ProctorsPage.tsx. */
   docsStatus?: 'not_started' | 'pending' | 'expired' | 'submitted' | '';
+  /** Mirrors the exact eligibility predicates the Send Docs/Verify/Activate bulk
+   * actions already use (see SelectionActionBar's handlers in ProctorsPage.tsx) --
+   * a filter view of "who could I bulk-act on right now", not a stored column. */
+  eligibility?: 'send_docs' | 'verify' | 'activate' | '';
 }
 
 // Interview Selects list filters -- 'status' mirrors the Form Status column's
@@ -195,6 +209,7 @@ export interface InterviewSelectFilters {
   search?: string;
   vendor?: Vendor | '';
   status?: 'not_sent' | 'shared' | 'expired' | 'submitted' | '';
+  ptype?: ProctorType | '';
 }
 
 /** Tab 0 (flat "Offboarded" list) of OffboardedPage only -- the "Re-onboard History"

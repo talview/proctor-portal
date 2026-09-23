@@ -7,14 +7,15 @@
 //                        content-type check against storage's own object metadata --
 //                        cheap, doesn't require downloading the file) and responds right
 //                        away with integrity_status:'pending'. The server still never
-//                        *trusts* the client's hash as final: a background task (see
-//                        verifyDocumentIntegrity below, run via EdgeRuntime.waitUntil)
-//                        separately downloads the object and recomputes the real SHA-256,
-//                        flipping the row to 'verified' or 'mismatch'. This used to be
-//                        done synchronously in "confirm" itself -- downloading the whole
-//                        file just to hash it before responding -- which is exactly the
-//                        blocking work this two-phase version removes from the signer's
-//                        critical path while keeping the verification itself.
+//                        *trusts* the client's hash as final: a durable
+//                        document_integrity_jobs row is queued for nda-jobs-worker,
+//                        which separately downloads the object and recomputes the real
+//                        SHA-256, flipping nda_session_documents to 'verified' or
+//                        'mismatch'. This used to run via EdgeRuntime.waitUntil, which
+//                        isn't durable -- if the function instance recycled before that
+//                        background promise resolved, the verification was silently
+//                        abandoned and the document stayed 'pending' forever with no
+//                        error shown to anyone.
 // The client's PUT to the signed URL happens directly against storage, never through
 // this function -- keeps the function fast and avoids body-size limits on 6 files.
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
@@ -22,15 +23,17 @@ import {
   adminClient,
   requireStepToken,
   logEvent,
-  sha256Hex,
   jsonResponse,
   errorResponse,
   corsHeaders,
   DOC_KINDS,
+  getClientIp,
+  getUserAgent,
 } from '../_shared/nda.ts'
 
 // Not a standard TS/Deno global -- see nda-session-submit for the same declaration and
-// the background-tasks doc link.
+// usage: only fires the worker's HTTP kick, the actual verification work runs in that
+// separate invocation.
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void }
 
 const ALLOWED_EXTENSIONS: Record<string, string> = {
@@ -42,59 +45,16 @@ const ALLOWED_EXTENSIONS: Record<string, string> = {
 const MAX_BYTES = 3 * 1024 * 1024 // 3MB
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/
 
-/**
- * Downloads the object and recomputes its real SHA-256, reconciling it against what the
- * client reported at confirm time. Runs after the response has already gone out, so it
- * never blocks the signer -- failures (including a hash mismatch) are recorded on the
- * row and the audit trail rather than thrown into the void, so handleFinalize (which
- * polls for 'pending' rows) can see and act on the outcome.
- */
-async function verifyDocumentIntegrity(
-  supabase: ReturnType<typeof adminClient>,
-  sessionId: string,
-  docKind: string,
-  path: string,
-  clientSha256: string
-) {
-  try {
-    const { data: fileData, error: downloadError } = await supabase.storage.from('nda-signing').download(path)
-    if (downloadError || !fileData) throw new Error('Could not read the uploaded file to verify it')
-
-    const bytes = new Uint8Array(await fileData.arrayBuffer())
-    const serverSha256 = await sha256Hex(bytes)
-    const matched = serverSha256 === clientSha256
-
-    await supabase
-      .from('nda_session_documents')
-      .update({
-        content_sha256: serverSha256,
-        integrity_status: matched ? 'verified' : 'mismatch',
-        verified_at: new Date().toISOString(),
-      })
-      .eq('session_id', sessionId)
-      .eq('doc_kind', docKind)
-
-    await logEvent(supabase, sessionId, matched ? 'document_verified' : 'document_integrity_mismatch', null, {
-      doc_kind: docKind,
-      client_sha256: clientSha256,
-      server_sha256: serverSha256,
-    })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error verifying the uploaded document'
-    console.error('verifyDocumentIntegrity failed:', error)
-    try {
-      // Treat an unverifiable file the same as a mismatch -- handleFinalize must never
-      // wave through a document it couldn't actually confirm the contents of.
-      await supabase
-        .from('nda_session_documents')
-        .update({ integrity_status: 'mismatch', verified_at: new Date().toISOString() })
-        .eq('session_id', sessionId)
-        .eq('doc_kind', docKind)
-      await logEvent(supabase, sessionId, 'document_integrity_mismatch', null, { doc_kind: docKind, message })
-    } catch (loggingError) {
-      console.error('Failed to record document verification failure:', loggingError)
-    }
-  }
+function kickNdaJobsWorker() {
+  const workerUrl = `${Deno.env.get('SUPABASE_URL')}/functions/v1/nda-jobs-worker`
+  const workerSecret = Deno.env.get('NDA_WORKER_SECRET') || ''
+  EdgeRuntime.waitUntil(
+    fetch(workerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Nda-Worker-Secret': workerSecret },
+      body: '{}',
+    }).catch((err) => console.error('Immediate NDA worker kick failed (cron will still pick this up):', err))
+  )
 }
 
 serve(async (req) => {
@@ -106,7 +66,7 @@ serve(async (req) => {
     const { stepToken, action, docKind } = body
 
     // 'signing' included so document uploads work while the signed PDF is still
-    // rendering in the background (see nda-session-submit's handleSign).
+    // rendering (see nda-session-submit's handleSign).
     const session = await requireStepToken(supabase, stepToken, ['consented', 'signing', 'signed'])
 
     if (!DOC_KINDS.includes(docKind)) throw new Error(`Invalid document kind: ${docKind}`)
@@ -151,9 +111,53 @@ serve(async (req) => {
       const ext = filename.split('.').pop()?.toLowerCase() || ''
       const contentType = fileMeta.metadata?.mimetype || ALLOWED_EXTENSIONS[ext] || 'application/octet-stream'
 
+      // Captured here, not in the worker -- by the time nda-jobs-worker actually
+      // verifies this, the uploader's original request (the only place a real IP/UA
+      // exists) is long gone. Threaded through the job row so the 'document_verified'/
+      // 'document_integrity_mismatch' event the worker logs still gets a real IP
+      // instead of "unknown" in the audit certificate.
+      const uploaderIp = getClientIp(req)
+      const uploaderUserAgent = getUserAgent(req)
+
+      // Job row created FIRST, not the document row -- its id is threaded onto
+      // nda_session_documents.verifying_job_id below so every later verification
+      // write (ndaVerify.ts, nda-jobs-worker's terminal-failure/stale-reclaim
+      // paths) can confirm it's still writing about the CURRENT upload generation
+      // before touching the document row, not a stale one still mid-flight from a
+      // just-removed/replaced document (see migration 0074). Upsert, not insert --
+      // a document replaced after a prior failed/completed verification (without
+      // going through remove() first) must start completely fresh; every job-state
+      // field is reset explicitly here, or a stale last_error/completed_at/
+      // locked_at from the old file would linger and confuse the worker or the
+      // admin view. remove() deletes this row outright (not a reset), so the
+      // common replace flow hits the INSERT branch here and gets a brand-new id
+      // regardless -- the upsert only matters for a same-generation retry.
+      const { data: jobRow, error: jobError } = await supabase
+        .from('document_integrity_jobs')
+        .upsert(
+          {
+            session_id: session.id,
+            doc_kind: docKind,
+            storage_path: path,
+            client_sha256: clientSha256,
+            uploader_ip: uploaderIp,
+            uploader_user_agent: uploaderUserAgent,
+            status: 'queued',
+            attempt_count: 0,
+            last_error: null,
+            next_retry_at: null,
+            locked_at: null,
+            completed_at: null,
+          },
+          { onConflict: 'session_id,doc_kind' }
+        )
+        .select('id')
+        .single()
+      if (jobError) throw jobError
+
       // Recorded immediately with the client-reported hash and integrity_status:'pending'
       // -- the row exists and the document reads as "uploaded" right away. The real
-      // server-side hash is filled in moments later by the background verification below.
+      // server-side hash is filled in moments later by nda-jobs-worker.
       const { error: upsertError } = await supabase.from('nda_session_documents').upsert(
         {
           session_id: session.id,
@@ -165,6 +169,7 @@ serve(async (req) => {
           verified_at: null,
           byte_size: byteSize,
           content_type: contentType,
+          verifying_job_id: jobRow.id,
         },
         { onConflict: 'session_id,doc_kind' }
       )
@@ -176,7 +181,8 @@ serve(async (req) => {
         bytes: byteSize,
       })
 
-      EdgeRuntime.waitUntil(verifyDocumentIntegrity(supabase, session.id, docKind, path, clientSha256))
+      await supabase.rpc('ensure_nda_jobs_cron')
+      kickNdaJobsWorker()
 
       return jsonResponse({ success: true, integrityStatus: 'pending' })
     }
@@ -199,6 +205,11 @@ serve(async (req) => {
         .eq('session_id', session.id)
         .eq('doc_kind', docKind)
       if (deleteError) throw deleteError
+
+      // Any queued/in-flight verification job for the just-deleted file is now stale --
+      // remove it rather than leaving the worker to eventually try (and fail) to
+      // download a path that no longer exists.
+      await supabase.from('document_integrity_jobs').delete().eq('session_id', session.id).eq('doc_kind', docKind)
 
       await logEvent(supabase, session.id, 'document_removed', req, { doc_kind: docKind })
 

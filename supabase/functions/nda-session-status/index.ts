@@ -19,7 +19,7 @@ serve(async (req) => {
       const stepTokenHash = await hashToken(stepToken)
       const { data } = await supabase
         .from('nda_signing_sessions')
-        .select('id, status, session_expires_at, step_token_expires_at, template_id, signer_name_snapshot')
+        .select('id, status, session_expires_at, step_token_expires_at, template_id, signer_name_snapshot, render_error')
         .eq('step_token_sha256', stepTokenHash)
         .maybeSingle()
       session = data
@@ -28,7 +28,7 @@ serve(async (req) => {
       const tokenHash = await hashToken(token)
       const { data } = await supabase
         .from('nda_signing_sessions')
-        .select('id, status, session_expires_at, step_token_expires_at, template_id, signer_name_snapshot')
+        .select('id, status, session_expires_at, step_token_expires_at, template_id, signer_name_snapshot, render_error')
         .eq('session_token_sha256', tokenHash)
         .maybeSingle()
       session = data
@@ -57,6 +57,27 @@ serve(async (req) => {
       })),
       allDocKinds: DOC_KINDS,
       stepTokenValid: stepTokenIsValid,
+    }
+
+    // Lets the Upload step show real "preparing your signed document"/"finalizing"
+    // progress (and a real failure) driven by the actual job, instead of only
+    // discovering a stuck render at Finalize time. Only the job_type actually
+    // relevant to the session's current status is looked up -- 'signing' means the
+    // sign_render job is what's in flight; 'signed' means finalize hasn't completed
+    // yet, so a finalize_certificate job (if the candidate has already hit Submit at
+    // least once) is what's relevant.
+    if (session.status === 'signing' || session.status === 'signed') {
+      const relevantJobType = session.status === 'signing' ? 'sign_render' : 'finalize_certificate'
+      const { data: job } = await supabase
+        .from('pdf_generation_jobs')
+        .select('status, last_error')
+        .eq('session_id', session.id)
+        .eq('job_type', relevantJobType)
+        .maybeSingle()
+      if (job) {
+        response.pdfJobStatus = job.status
+        response.pdfJobError = job.status === 'failed' ? (job.last_error || session.render_error || null) : null
+      }
     }
 
     // Only hand over template details (field positions, a signed PDF URL) once

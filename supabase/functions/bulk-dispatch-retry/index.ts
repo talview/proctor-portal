@@ -39,6 +39,11 @@ serve(async (req) => {
       p_ref_id: jobId,
     })
 
+    // Re-arms the cron backstop -- it may have self-unscheduled since the last job
+    // completed (see migration 0051), and these re-queued items need it just as much
+    // as a brand-new job's do.
+    await supabase.rpc('ensure_bulk_dispatch_cron')
+
     const workerUrl = `${Deno.env.get('SUPABASE_URL')}/functions/v1/bulk-dispatch-worker`
     const workerSecret = Deno.env.get('BULK_WORKER_SECRET') || ''
     EdgeRuntime.waitUntil(

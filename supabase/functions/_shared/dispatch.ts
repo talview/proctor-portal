@@ -146,12 +146,29 @@ export async function dispatchOnboardingDocs(
     }
 
     // Supersede any still-live session first -- the one-live-session-per-proctor
-    // unique index would otherwise reject the insert.
+    // unique index would otherwise reject the insert. But a session where the
+    // candidate has already made real progress (OTP verified, consented, mid-signing,
+    // or signed but not yet finished uploading docs) is not safe to just revoke out
+    // from under them -- resending in that window used to silently kill their
+    // in-progress session and hand them a dead link, with no warning to whoever sent
+    // it. A session still sitting at 'created' (link emailed, nothing done yet) has
+    // nothing to lose, so resending there is unchanged.
     const { data: liveSessions } = await supabase
       .from('nda_signing_sessions')
-      .select('id')
+      .select('id, status')
       .eq('proctor_id', proctor.id)
       .in('status', ['created', 'otp_verified', 'consented', 'signing', 'signed'])
+
+    const inProgressSession = (liveSessions || []).find((s) =>
+      ['otp_verified', 'consented', 'signing', 'signed'].includes(s.status)
+    )
+    if (inProgressSession) {
+      return {
+        success: false,
+        error:
+          'Candidate already has an NDA/docs session in progress (past the initial link) -- resending now would invalidate what they\'ve already done. Wait for them to finish, or confirm with them before resending.',
+      }
+    }
 
     if (liveSessions && liveSessions.length > 0) {
       const ids = liveSessions.map((s) => s.id)

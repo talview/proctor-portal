@@ -6,7 +6,8 @@ import { useAuthStore } from '@/stores/auth';
 import Input from '@/components/ui/Input';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import { showAlert, showConfirm } from '@/components/ui/GlobalDialog';
 
 interface Customer {
@@ -29,7 +30,7 @@ const SESSION_TYPES = [
 
 const SESSION_COLORS: Record<string, string> = {
   'Live Proctoring': 'bg-accent/15 text-accent',
-  'Record & Review': 'bg-purple-400/15 text-purple-400',
+  'Record & Review': 'bg-info/15 text-info',
   'Testing': 'bg-success/15 text-success',
   'Training': 'bg-warning/15 text-warning',
   'Other Value Added Services': 'bg-danger/15 text-danger',
@@ -128,39 +129,49 @@ export default function CustomersPage() {
       </div>
 
       {/* Customer List */}
-      <Table
+      <DataTable
         data={customers}
         isLoading={isLoading}
+        onRowClick={handleEditCustomer}
         emptyMessage="No customers yet. Add your first customer to start managing certifications."
         columns={[
           {
+            id: 'customer',
             header: 'Customer',
-            accessor: (customer) => (
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold text-text">{customer.name}</span>
-                  <span className="font-mono text-[11px] font-bold px-2 py-0.5 rounded bg-accent/15 text-accent">
-                    {customer.org_id || 'No Org ID'}
-                  </span>
+            enableSorting: false,
+            cell: ({ row }) => {
+              const customer = row.original;
+              return (
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold text-text">{customer.name}</span>
+                    <span className="font-mono text-[11px] font-bold px-2 py-0.5 rounded bg-accent/15 text-accent">
+                      {customer.org_id || 'No Org ID'}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-text3 mt-0.5">
+                    Added {formatDate(customer.created_at)} · by {customer.created_by || '—'}
+                  </div>
                 </div>
-                <div className="text-[11px] text-text3 mt-0.5">
-                  Added {formatDate(customer.created_at)} · by {customer.created_by || '—'}
-                </div>
-              </div>
-            ),
+              );
+            },
           },
           {
+            id: 'sop_version',
             header: 'SOP Version',
-            accessor: (customer) => (
-              <span className="text-lg font-bold text-accent">v{customer.current_version}</span>
+            enableSorting: false,
+            cell: ({ row }) => (
+              <span className="text-lg font-bold text-accent">v{row.original.current_version}</span>
             ),
           },
           {
+            id: 'session_types',
             header: 'Session Types',
-            accessor: (customer) => (
+            enableSorting: false,
+            cell: ({ row }) => (
               <div className="flex items-center gap-1.5 flex-wrap">
-                {customer.session_type && customer.session_type.length > 0 ? (
-                  customer.session_type.map((type) => (
+                {row.original.session_type && row.original.session_type.length > 0 ? (
+                  row.original.session_type.map((type) => (
                     <span
                       key={type}
                       className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${
@@ -177,28 +188,33 @@ export default function CustomersPage() {
             ),
           },
           {
+            id: 'actions',
             header: 'Actions',
-            className: 'text-right',
-            accessor: (customer) => (
-              <div className="flex gap-2 justify-end">
-                <Button variant="ghost" size="sm" onClick={() => handleBumpVersion(customer)}>
-                  <ArrowUpCircle className="w-3.5 h-3.5" /> Bump SOP
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => handleEditCustomer(customer)}>
-                  <Pencil className="w-3.5 h-3.5" /> Edit
-                </Button>
-                <Button
-                  variant="danger"
-                  size="sm"
-                  onClick={() => handleDeleteCustomer(customer)}
-                  disabled={deleteMutation.isPending}
-                >
-                  <Trash2 className="w-3.5 h-3.5" /> Delete
-                </Button>
-              </div>
-            ),
+            enableSorting: false,
+            meta: { className: 'text-right' },
+            cell: ({ row }) => {
+              const customer = row.original;
+              return (
+                <div className="flex gap-2 justify-end" onClick={(e) => e.stopPropagation()}>
+                  <Button variant="ghost" size="sm" onClick={() => handleBumpVersion(customer)}>
+                    <ArrowUpCircle className="w-3.5 h-3.5" /> Bump SOP
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => handleEditCustomer(customer)}>
+                    <Pencil className="w-3.5 h-3.5" /> Edit
+                  </Button>
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    onClick={() => handleDeleteCustomer(customer)}
+                    disabled={deleteMutation.isPending}
+                  >
+                    <Trash2 className="w-3.5 h-3.5" /> Delete
+                  </Button>
+                </div>
+              );
+            },
           },
-        ]}
+        ] satisfies ColumnDef<Customer, any>[]}
       />
 
       {/* Add/Edit Modal */}

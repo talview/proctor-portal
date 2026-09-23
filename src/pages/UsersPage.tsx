@@ -7,13 +7,15 @@ import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import Button from '@/components/ui/Button';
 import Modal from '@/components/ui/Modal';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import type { ColumnDef } from '@tanstack/react-table';
 import { showAlert, showConfirm } from '@/components/ui/GlobalDialog';
 
 interface Profile {
   id: string;
   username: string;
   email: string;
+  name: string | null;
   role: string;
   vendor_id: string | null;
   vendors: { name: string } | null;
@@ -30,7 +32,7 @@ export default function UsersPage() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('users')
-        .select('id, username, email, role, vendor_id, vendors(name)')
+        .select('id, username, email, name, role, vendor_id, vendors(name)')
         .order('email', { ascending: true });
 
       if (error) throw error;
@@ -69,43 +71,59 @@ export default function UsersPage() {
         </Button>
       </div>
 
-      <Table
+      <DataTable
         data={profiles}
         isLoading={isLoading}
+        onRowClick={setEditingProfile}
         emptyMessage="No users yet. Click + Create User to add one."
         columns={[
           {
+            id: 'name',
+            header: 'Name',
+            enableSorting: false,
+            cell: ({ row }) => row.original.name || <span className="text-text3">—</span>,
+            meta: { className: 'font-semibold text-text' },
+          },
+          {
+            id: 'email',
             header: 'Email',
-            accessor: (row) => (
+            enableSorting: false,
+            cell: ({ row }) => (
               <div>
-                <div className="font-semibold text-text">{row.email || '—'}</div>
-                <div className="text-[11px] text-text3">{row.username}</div>
+                <div className="font-semibold text-text">{row.original.email || '—'}</div>
+                <div className="text-[11px] text-text3">{row.original.username}</div>
               </div>
             ),
           },
           {
+            id: 'role',
             header: 'Role',
-            accessor: (row) => (
+            enableSorting: false,
+            cell: ({ row }) => (
               <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-info/10 text-info capitalize">
-                {row.role}
+                {row.original.role}
               </span>
             ),
           },
           {
+            id: 'vendor',
             header: 'Vendor',
-            accessor: (row) => row.vendors?.name || <span className="text-text3">—</span>,
+            enableSorting: false,
+            cell: ({ row }) => row.original.vendors?.name || <span className="text-text3">—</span>,
           },
           {
+            id: 'actions',
             header: 'Actions',
-            accessor: (row) => (
-              <div className="flex gap-1">
-                <Button variant="ghost" size="sm" onClick={() => setEditingProfile(row)}>
-                  Change Role
+            enableSorting: false,
+            cell: ({ row }) => (
+              <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
+                <Button variant="ghost" size="sm" onClick={() => setEditingProfile(row.original)}>
+                  Edit
                 </Button>
                 <Button
                   variant="danger"
                   size="sm"
-                  onClick={() => handleDelete(row)}
+                  onClick={() => handleDelete(row.original)}
                   disabled={deleteMutation.isPending}
                 >
                   Delete
@@ -113,7 +131,7 @@ export default function UsersPage() {
               </div>
             ),
           },
-        ]}
+        ] satisfies ColumnDef<Profile, any>[]}
       />
 
       {showModal && (
@@ -145,6 +163,7 @@ interface VendorOption {
 }
 
 function InviteUserModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [role, setRole] = useState('');
   const [vendorId, setVendorId] = useState('');
@@ -162,12 +181,13 @@ function InviteUserModal({ onClose, onSuccess }: { onClose: () => void; onSucces
 
   const inviteMutation = useMutation({
     mutationFn: async () => {
+      if (!name.trim()) throw new Error('Enter a name');
       if (!email || !email.includes('@')) throw new Error('Enter a valid email');
       if (!role) throw new Error('Select a role');
       if (role === 'vendor' && !vendorId) throw new Error('Select a vendor');
 
       return invokeEdgeFunction<{ success: boolean; password?: string }>('invite-user', {
-        email: email.trim(), role, vendorId: role === 'vendor' ? vendorId : undefined, mode,
+        name: name.trim(), email: email.trim(), role, vendorId: role === 'vendor' ? vendorId : undefined, mode,
       });
     },
     onSuccess: (data) => {
@@ -192,7 +212,10 @@ function InviteUserModal({ onClose, onSuccess }: { onClose: () => void; onSucces
             <div className="bg-warning/10 border border-warning/30 rounded-lg p-3">
               <div className="text-xs font-semibold text-text mb-1">Temporary password (shown once)</div>
               <div className="font-mono text-sm text-text select-all">{result.password}</div>
-              <div className="text-[11px] text-text3 mt-2">Share this with the user directly — it will not be shown again.</div>
+              <div className="text-[11px] text-text3 mt-2">
+                Share this with the user directly — it will not be shown again. They'll be required to set their own
+                password the first time they sign in.
+              </div>
             </div>
           )}
           <div className="flex justify-end pt-2 border-t border-border">
@@ -206,6 +229,11 @@ function InviteUserModal({ onClose, onSuccess }: { onClose: () => void; onSucces
   return (
     <Modal isOpen={true} onClose={onClose} title="Create User">
       <div className="space-y-4">
+        <div>
+          <label className="block text-xs font-semibold text-text mb-1">Name <span className="text-danger">*</span></label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name" />
+        </div>
+
         <div>
           <label className="block text-xs font-semibold text-text mb-1">Email <span className="text-danger">*</span></label>
           <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@company.com" />
@@ -276,6 +304,7 @@ function InviteUserModal({ onClose, onSuccess }: { onClose: () => void; onSucces
 }
 
 function ChangeRoleModal({ profile, onClose, onSuccess }: { profile: Profile; onClose: () => void; onSuccess: () => void }) {
+  const [name, setName] = useState(profile.name || '');
   const [role, setRole] = useState(profile.role);
   const [vendorId, setVendorId] = useState(profile.vendor_id || '');
 
@@ -293,15 +322,25 @@ function ChangeRoleModal({ profile, onClose, onSuccess }: { profile: Profile; on
       if (!role) throw new Error('Select a role');
       if (role === 'vendor' && !vendorId) throw new Error('Select a vendor');
 
-      const { error } = await supabase
-        .from('users')
-        .update({ role, vendor_id: role === 'vendor' ? vendorId : null })
-        .eq('id', profile.id);
+      // Two separate RPCs (name, role) -- update_user_role is guarded against
+      // self/last-admin demotion and pre-dates name entirely; simplest to leave
+      // it untouched and add name as its own small RPC rather than widen its
+      // signature and every existing call site's understanding of what it does.
+      if (name.trim() !== (profile.name || '')) {
+        const { error: nameError } = await supabase.rpc('update_user_name', { p_user_id: profile.id, p_name: name });
+        if (nameError) throw nameError;
+      }
+
+      const { error } = await supabase.rpc('update_user_role', {
+        p_user_id: profile.id,
+        p_role: role,
+        p_vendor_id: role === 'vendor' ? vendorId : null,
+      });
 
       if (error) throw error;
     },
     onSuccess: () => {
-      showAlert('Role updated', { tone: 'success' });
+      showAlert('User updated', { tone: 'success' });
       onSuccess();
     },
     onError: (err: any) => {
@@ -310,8 +349,13 @@ function ChangeRoleModal({ profile, onClose, onSuccess }: { profile: Profile; on
   });
 
   return (
-    <Modal isOpen={true} onClose={onClose} title={`Change Role — ${profile.email}`}>
+    <Modal isOpen={true} onClose={onClose} title={`Edit User — ${profile.email}`}>
       <div className="space-y-4">
+        <div>
+          <label className="block text-xs font-semibold text-text mb-1">Name</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name" />
+        </div>
+
         <div>
           <label className="block text-xs font-semibold text-text mb-1">Role <span className="text-danger">*</span></label>
           <Select

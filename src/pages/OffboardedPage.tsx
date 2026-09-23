@@ -8,25 +8,34 @@ import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 import Select from '@/components/ui/Select';
 import { getScopedVendor } from '@/utils/access';
-import { useManagedByOptions } from '@/hooks/useManagedByOptions';
-import { usePaginatedQuery } from '@/hooks/usePaginatedQuery';
+import { useVendorOptions } from '@/hooks/useVendorOptions';
+import { useCursorPaginatedQuery } from '@/hooks/useCursorPaginatedQuery';
 import { showAlert, showConfirm } from '@/components/ui/GlobalDialog';
-import { downloadCsv } from '@/lib/csv';
+import { downloadCsv, EXPORT_ROW_CAP } from '@/lib/csv';
+import { localDateString } from '@/utils/formatters';
+import { orIlikeFilter } from '@/utils/postgrest';
 import ClearFiltersButton from '@/components/ui/ClearFiltersButton';
-import Table from '@/components/ui/Table';
+import DataTable from '@/components/ui/DataTable';
+import Badge from '@/components/ui/Badge';
+import { ProctorDrawer } from './ProctorsPage';
+import type { ColumnDef } from '@tanstack/react-table';
 import type { Proctor, OffboardedFilters } from '@/types';
 
 export default function OffboardedPage() {
   const { user } = useAuthStore();
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState(0);
+  // Read-only reuse of Proctors' own drawer -- isAdmin/isVendor false throughout
+  // means no edit pencil, no document replace/remove: correcting an offboarded
+  // record means re-onboarding it first (the action already on this page), not
+  // editing it in place from here.
+  const [viewingProctor, setViewingProctor] = useState<Proctor | null>(null);
   const [filters, setFilters] = useState<OffboardedFilters>({ search: '', vendor: '' });
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [historySearch, setHistorySearch] = useState('');
   const [historyVendorFilter, setHistoryVendorFilter] = useState('');
-  const [page, setPage] = useState(1);
   const PAGE_SIZE = 25;
-  const { data: managedByOptions = [] } = useManagedByOptions();
+  const { data: vendorOptions = [] } = useVendorOptions();
 
   const isAdmin = user?.role === 'admin';
   const isVendor = user?.role === 'vendor';
@@ -42,42 +51,42 @@ export default function OffboardedPage() {
   // Fetch offboarded proctors (tab 0, flat list) -- server-side paginated,
   // searched and vendor-filtered (was a flat fetch-all with client-side
   // filtering; see IncompletePage's identical scoping for the OR pattern below).
-  const { data: pageResult, isLoading: isLoadingOffboarded, isFetching: isFetchingOffboarded } = usePaginatedQuery<Proctor>({
+  const {
+    data: offboardedProctors,
+    isLoading: isLoadingOffboarded,
+    isFetching: isFetchingOffboarded,
+    hasNextPage: offboardedHasNextPage,
+    hasPreviousPage: offboardedHasPreviousPage,
+    goToNextPage: offboardedGoToNextPage,
+    goToPreviousPage: offboardedGoToPreviousPage,
+    pageIndex: offboardedPageIndex,
+  } = useCursorPaginatedQuery<Proctor>({
     queryKey: ['offboarded-proctors', user?.vendor, filters.vendor],
     table: 'proctors',
     filters: (q) => {
       let query = q.eq('status', 'Offboarded');
 
-      // Vendor role sees only their proctors. Previously chained as
-      // `.eq('vendor', scopedVendor).or(\`managed_by.eq.${scopedVendor}\`)`, which
-      // PostgREST/supabase-js ANDs together (vendor=X AND managed_by=X) -- almost
-      // certainly not the intent. Fixed to match IncompletePage's identical
-      // scoping: a single .or() so a proctor managed by OR vendor-tagged as this
-      // vendor is included.
+      // Vendor role sees only their proctors.
       if (scopedVendor) {
-        query = query.or(`vendor.eq.${scopedVendor},managed_by.eq.${scopedVendor}`);
+        query = query.eq('vendor', scopedVendor);
       }
 
-      // `vendor` here means the display vendor (managed_by || vendor), so the
-      // filter dropdown needs to check both underlying columns too.
       if (filters.vendor) {
-        query = query.or(`managed_by.eq.${filters.vendor},vendor.eq.${filters.vendor}`);
+        query = query.eq('vendor', filters.vendor);
       }
 
       return query;
     },
-    searchColumns: ['name', 'pid', 'phone'],
+    searchColumns: ['name', 'pid'],
     searchTerm: debouncedSearch,
-    page,
     pageSize: PAGE_SIZE,
     orderBy: { column: 'oat', ascending: false },
+    resetKey: filters.vendor,
+    // Narrowed from select('*') -- verified against this tab's table columns; the
+    // "View" button has no onClick (no modal reads this row), and both CSV exports
+    // (exportOffboarded, archivedProctors) run their own separate full-select queries.
+    select: 'id, pid, name, vendor, oat, off_reason',
   });
-
-  const offboardedProctors = useMemo(
-    () => (pageResult?.data ?? []).map(p => ({ ...p, vendor: p.managed_by || p.vendor || '' })),
-    [pageResult]
-  );
-  const offboardedCount = pageResult?.count ?? 0;
 
   // Fetch archived proctors for history (admin only)
   const { data: archivedProctors = [], isLoading: isLoadingHistory } = useQuery({
@@ -93,10 +102,7 @@ export default function OffboardedPage() {
 
       if (error) throw error;
 
-      return (data as Proctor[]).map(p => ({
-        ...p,
-        vendor: p.managed_by || p.vendor || ''
-      }));
+      return data as Proctor[];
     },
     enabled: isAdmin,
   });
@@ -158,51 +164,38 @@ export default function OffboardedPage() {
     return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
   };
 
-  const getStatusBadge = (status: string) => {
-    const colors: Record<string, string> = {
-      'Active': 'bg-success/10 text-success',
-      'In Progress': 'bg-warning/10 text-warning',
-      'Verified': 'bg-info/10 text-info',
-      'Archived': 'bg-text3/10 text-text3',
-      'Offboarded': 'bg-danger/10 text-danger',
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[11px] font-semibold ${colors[status] || 'bg-text3/10 text-text3'}`}>
-        {status}
-      </span>
-    );
-  };
-
   // Tab 0's main query is now paginated (25/page), so exporting means fetching
   // every row matching the current filters fresh, not just what's on screen --
   // same shape as ProctorsPage's handleExport -> proctorService.getAll(filters).
   // There's no dedicated proctorService entry for the Offboarded list, so this
   // mirrors the exact same filter/scoping logic as the paginated query above,
-  // minus the .range().
-  const exportOffboarded = async (): Promise<Proctor[]> => {
+  // bounded by EXPORT_ROW_CAP instead of the on-screen page's .range().
+  const exportOffboarded = async (): Promise<{ rows: Proctor[]; truncated: boolean }> => {
     let query = supabase.from('proctors').select('*').eq('status', 'Offboarded').order('oat', { ascending: false });
 
     if (scopedVendor) {
-      query = query.or(`vendor.eq.${scopedVendor},managed_by.eq.${scopedVendor}`);
+      query = query.eq('vendor', scopedVendor);
     }
     if (filters.vendor) {
-      query = query.or(`managed_by.eq.${filters.vendor},vendor.eq.${filters.vendor}`);
+      query = query.eq('vendor', filters.vendor);
     }
     const trimmedSearch = debouncedSearch.trim();
     if (trimmedSearch) {
-      query = query.or(['name', 'pid', 'phone'].map((c) => `${c}.ilike.%${trimmedSearch}%`).join(','));
+      query = query.or(orIlikeFilter(['name', 'pid', 'phone'], trimmedSearch));
     }
 
-    const { data, error } = await query;
+    const { data, error } = await query.range(0, EXPORT_ROW_CAP);
     if (error) throw error;
-    return (data as Proctor[]).map((p) => ({ ...p, vendor: p.managed_by || p.vendor || '' }));
+    const rows = (data ?? []) as Proctor[];
+    return { rows: rows.slice(0, EXPORT_ROW_CAP), truncated: rows.length > EXPORT_ROW_CAP };
   };
 
   const exportCsv = async (tab: 'offboarded' | 'history') => {
     let list: Proctor[];
+    let truncated = false;
     if (tab === 'offboarded') {
       try {
-        list = await exportOffboarded();
+        ({ rows: list, truncated } = await exportOffboarded());
       } catch (error: any) {
         showAlert('Export failed: ' + error.message, { tone: 'error' });
         return;
@@ -217,12 +210,12 @@ export default function OffboardedPage() {
     }
 
     downloadCsv(
-      `proctors_${tab}_${new Date().toISOString().slice(0, 10)}.csv`,
+      `proctors_${tab}_${localDateString()}.csv`,
       ['Proctor ID', 'Name', 'Vendor', 'Type', 'Phone', 'Email', 'City', 'State', 'Status', 'BGV', 'NDA', 'Created', 'Activated', 'Offboarded'],
       list.map((p) => [
         p.pid || '',
         p.name || '',
-        p.vendor || p.managed_by || '',
+        p.vendor || '',
         p.ptype || '',
         p.phone || '',
         p.email || '',
@@ -236,6 +229,12 @@ export default function OffboardedPage() {
         formatDate(p.oat || ''),
       ])
     );
+    if (truncated) {
+      showAlert(
+        `Export capped at ${EXPORT_ROW_CAP.toLocaleString()} rows -- narrow your filters to get a complete export.`,
+        { tone: 'error' }
+      );
+    }
   };
 
   return (
@@ -260,32 +259,23 @@ export default function OffboardedPage() {
             <Input
               placeholder="Name, ID, phone..."
               value={filters.search}
-              onChange={(e) => {
-                setFilters({ ...filters, search: e.target.value });
-                setPage(1);
-              }}
+              onChange={(e) => setFilters({ ...filters, search: e.target.value })}
               wrapperClassName="flex-1 min-w-[180px]"
             />
             {!isVendor && (
               <Select
                 options={[
                   { value: '', label: 'All Vendors' },
-                  ...managedByOptions,
+                  ...vendorOptions,
                 ]}
                 value={filters.vendor}
-                onChange={(e) => {
-                  setFilters({ ...filters, vendor: e.target.value as any });
-                  setPage(1);
-                }}
+                onChange={(e) => setFilters({ ...filters, vendor: e.target.value as any })}
                 wrapperClassName="min-w-[160px]"
               />
             )}
             <ClearFiltersButton
               show={!!(filters.search || filters.vendor)}
-              onClick={() => {
-                setFilters({ search: '', vendor: '' });
-                setPage(1);
-              }}
+              onClick={() => setFilters({ search: '', vendor: '' })}
             />
             <Button variant="ghost" size="sm" onClick={() => exportCsv('offboarded')}>
 <Download className="w-3.5 h-3.5" /> Export
@@ -293,44 +283,58 @@ export default function OffboardedPage() {
           </div>
 
           {/* Table */}
-          <Table
+          <DataTable
             data={offboardedProctors}
             isLoading={isLoadingOffboarded}
+            onRowClick={setViewingProctor}
             emptyMessage="No offboarded proctors"
-            pagination={{ page, pageSize: PAGE_SIZE, count: offboardedCount, isFetching: isFetchingOffboarded, onPageChange: setPage }}
+            pagination={{
+              pageIndex: offboardedPageIndex,
+              pageSize: PAGE_SIZE,
+              hasNextPage: offboardedHasNextPage,
+              hasPreviousPage: offboardedHasPreviousPage,
+              isFetching: isFetchingOffboarded,
+              onNext: offboardedGoToNextPage,
+              onPrevious: offboardedGoToPreviousPage,
+            }}
             columns={[
-              { header: 'ID', accessor: (proctor) => proctor.pid || '—', className: 'font-mono text-[12px] text-info' },
-              { header: 'Name', accessor: (proctor) => proctor.name, className: 'text-[13px] text-text font-semibold' },
-              { header: 'Vendor', accessor: (proctor) => proctor.vendor, className: 'text-[12px] text-text2' },
-              { header: 'Offboarded', accessor: (proctor) => formatDate(proctor.oat!), className: 'text-[12px] text-text3' },
-              { header: 'Reason', accessor: (proctor) => proctor.off_reason || '—', className: 'text-[12px] text-text2' },
+              { id: 'pid', header: 'ID', enableSorting: false, cell: ({ row }) => row.original.pid || '—', meta: { className: 'font-mono text-[12px] text-info' } },
+              { id: 'name', header: 'Name', enableSorting: false, cell: ({ row }) => row.original.name, meta: { className: 'text-[13px] text-text font-semibold' } },
+              { id: 'vendor', header: 'Vendor', enableSorting: false, cell: ({ row }) => row.original.vendor, meta: { className: 'text-[12px] text-text2' } },
+              { id: 'oat', header: 'Offboarded', enableSorting: false, cell: ({ row }) => formatDate(row.original.oat!), meta: { className: 'text-[12px] text-text3' } },
+              { id: 'off_reason', header: 'Reason', enableSorting: false, cell: ({ row }) => row.original.off_reason || '—', meta: { className: 'text-[12px] text-text2' } },
               {
+                id: 'actions',
                 header: 'Actions',
-                accessor: (proctor) => (
-                  <div className="flex gap-1">
-                    <Button variant="ghost" size="sm">
-                      <Eye className="w-3.5 h-3.5" /> View
-                    </Button>
-                    {isAdmin && (
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={async () => {
-                          const ok = await showConfirm(
-                            `Re-onboard ${proctor.name}? They will start fresh in In Progress.`,
-                            { title: 'Re-onboard proctor', confirmLabel: 'Re-onboard' }
-                          );
-                          if (ok) reOnboardMutation.mutate(proctor.id);
-                        }}
-                        disabled={reOnboardMutation.isPending}
-                      >
-                        <Undo2 className="w-3.5 h-3.5" /> Re-onboard
+                enableSorting: false,
+                cell: ({ row }) => {
+                  const proctor = row.original;
+                  return (
+                    <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
+                      <Button variant="ghost" size="sm" onClick={() => setViewingProctor(proctor)}>
+                        <Eye className="w-3.5 h-3.5" /> View
                       </Button>
-                    )}
-                  </div>
-                ),
+                      {isAdmin && (
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          onClick={async () => {
+                            const ok = await showConfirm(
+                              `Re-onboard ${proctor.name}? They will start fresh in In Progress.`,
+                              { title: 'Re-onboard proctor', confirmLabel: 'Re-onboard' }
+                            );
+                            if (ok) reOnboardMutation.mutate(proctor.id);
+                          }}
+                          disabled={reOnboardMutation.isPending}
+                        >
+                          <Undo2 className="w-3.5 h-3.5" /> Re-onboard
+                        </Button>
+                      )}
+                    </div>
+                  );
+                },
               },
-            ]}
+            ] satisfies ColumnDef<Proctor, any>[]}
           />
         </div>
       )}
@@ -349,7 +353,7 @@ export default function OffboardedPage() {
                 <Select
                   options={[
                     { value: '', label: 'All Vendors' },
-                    ...managedByOptions,
+                    ...vendorOptions,
                   ]}
                   value={historyVendorFilter}
                   onChange={(e) => setHistoryVendorFilter(e.target.value)}
@@ -368,26 +372,35 @@ export default function OffboardedPage() {
           </div>
 
           {/* History Timeline */}
-          <Table
+          <DataTable
             data={historyGroups}
             isLoading={isLoadingHistory}
             emptyMessage="No re-onboard history. Proctors who have been offboarded and re-onboarded will appear here."
             columns={[
               {
+                id: 'proctor',
                 header: 'Proctor',
-                className: 'align-top whitespace-nowrap',
-                accessor: (group) => (
-                  <div>
-                    <div className="text-sm font-semibold text-text">{group[0].name}</div>
-                    <div className="text-[11px] text-text3">
-                      {group.length} onboarding cycle{group.length > 1 ? 's' : ''}
+                enableSorting: false,
+                meta: { className: 'align-top whitespace-nowrap' },
+                cell: ({ row }) => {
+                  const group = row.original;
+                  return (
+                    <div>
+                      <div className="text-sm font-semibold text-text">{group[0].name}</div>
+                      <div className="text-[11px] text-text3">
+                        {group.length} onboarding cycle{group.length > 1 ? 's' : ''}
+                      </div>
                     </div>
-                  </div>
-                ),
+                  );
+                },
               },
               {
+                id: 'timeline',
                 header: 'Onboarding Timeline',
-                accessor: (group) => (
+                enableSorting: false,
+                cell: ({ row }) => {
+                  const group = row.original;
+                  return (
                   <div className="flex items-center gap-3 overflow-x-auto py-1">
                     {group.map((proctor, cycleIdx) => (
                       <div key={proctor.id} className="flex items-center gap-3">
@@ -410,7 +423,7 @@ export default function OffboardedPage() {
                               </div>
                             ) : (
                               <div className="text-[11px]">
-                                {getStatusBadge(proctor.status)}
+                                <Badge status={proctor.status} />
                               </div>
                             )}
                           </div>
@@ -421,20 +434,37 @@ export default function OffboardedPage() {
                       </div>
                     ))}
                   </div>
-                ),
+                  );
+                },
               },
               {
+                id: 'actions',
                 header: 'Actions',
-                className: 'align-top text-right whitespace-nowrap',
-                accessor: () => (
-                  <Button variant="ghost" size="sm">
+                enableSorting: false,
+                meta: { className: 'align-top text-right whitespace-nowrap' },
+                cell: ({ row }) => (
+                  <Button variant="ghost" size="sm" onClick={() => setViewingProctor(row.original[row.original.length - 1])}>
                     <Eye className="w-3.5 h-3.5" /> View Current
                   </Button>
                 ),
               },
-            ]}
+            ] satisfies ColumnDef<Proctor[], any>[]}
           />
         </div>
+      )}
+
+      {viewingProctor && (
+        <ProctorDrawer
+          proctor={viewingProctor}
+          mode="view"
+          isAdmin={false}
+          isVendor={false}
+          onClose={() => setViewingProctor(null)}
+          onEdit={() => {}}
+          onCancelEdit={() => {}}
+          onSave={() => {}}
+          isSaving={false}
+        />
       )}
     </div>
   );

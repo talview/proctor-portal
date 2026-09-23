@@ -39,11 +39,16 @@ export default defineConfig({
         },
       },
     },
-    // pdfjs-dist (see vendor-pdf above) is a genuinely large library that's already
-    // isolated to the one route that needs it (NDA signing) -- raising this past
-    // its ~500KB just avoids a warning for a chunk that's expected to stay large,
-    // rather than chasing further splits inside pdf.js itself for little benefit.
-    chunkSizeWarningLimit: 600,
+    // pdfjs-dist (see vendor-pdf above) and exceljs are both genuinely large
+    // libraries that are already isolated behind their own dynamic import (NDA
+    // signing's lazy route, and the group-evaluation xlsx helpers' `await
+    // import('exceljs')` inside assessmentGroupXlsx.ts) -- confirmed via
+    // dist/index.html referencing neither chunk, so neither is fetched on initial
+    // page load, only when that specific feature actually runs. Raising this past
+    // exceljs's ~940KB just avoids a warning for chunks that are expected to stay
+    // large and are already lazy, rather than chasing further splits for no real
+    // load-time benefit.
+    chunkSizeWarningLimit: 1000,
   },
   test: {
     globals: true,

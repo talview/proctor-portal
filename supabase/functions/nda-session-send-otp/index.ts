@@ -15,6 +15,7 @@ import {
 } from '../_shared/nda.ts'
 
 const MAX_RESENDS = 8
+const OTP_COOLDOWN_SECONDS = 30
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
@@ -27,7 +28,7 @@ serve(async (req) => {
     const tokenHash = await hashToken(token)
     const { data: session, error } = await supabase
       .from('nda_signing_sessions')
-      .select('id, status, session_expires_at, signer_email_snapshot, signer_name_snapshot, otp_send_count')
+      .select('id, status, session_expires_at, signer_email_snapshot, signer_name_snapshot, otp_send_count, otp_last_sent_at')
       .eq('session_token_sha256', tokenHash)
       .maybeSingle()
     if (error || !session) throw new Error('Invalid or expired link')
@@ -42,21 +43,19 @@ serve(async (req) => {
       throw new Error('Too many code requests for this link. Contact your coordinator.')
     }
 
+    // Short cooldown between clicks -- MAX_RESENDS alone doesn't stop someone from
+    // mashing "resend" and burning through that lifetime cap in seconds.
+    if (session.otp_last_sent_at) {
+      const secondsSinceLastSend = (Date.now() - new Date(session.otp_last_sent_at).getTime()) / 1000
+      if (secondsSinceLastSend < OTP_COOLDOWN_SECONDS) {
+        throw new Error(`Please wait a moment before requesting another code (${Math.ceil(OTP_COOLDOWN_SECONDS - secondsSinceLastSend)}s).`)
+      }
+    }
+
     const otp = generateOtp()
     const otpHash = await hashOtp(otp)
     const otpExpiresAt = new Date()
     otpExpiresAt.setMinutes(otpExpiresAt.getMinutes() + 10)
-
-    const { error: updateError } = await supabase
-      .from('nda_signing_sessions')
-      .update({
-        otp_sha256: otpHash,
-        otp_expires_at: otpExpiresAt.toISOString(),
-        otp_failed_attempts: 0,
-        otp_send_count: session.otp_send_count + 1,
-      })
-      .eq('id', session.id)
-    if (updateError) throw updateError
 
     const emailParts = session.signer_email_snapshot.split('@')
     const maskedEmail = `${emailParts[0].slice(0, 3)}***@${emailParts[1]}`
@@ -87,7 +86,26 @@ serve(async (req) => {
 </div></div></body></html>`
     const emailText = `Hello ${recipientName},\n\nYour one-time verification code is: ${otp}\n\nThis code expires in 10 minutes. Do not share it with anyone.`
 
+    // Sent BEFORE any OTP state is committed -- this used to write the new hash/
+    // send-count/cooldown first and only then attempt the send, so a Mailgun
+    // failure after that write left the candidate with no code delivered but a
+    // burned resend attempt and an active cooldown anyway. Ordering it this way
+    // means a failed send throws (caught below) before anything is persisted, so
+    // retrying the click genuinely gets a fresh attempt instead of a wasted one.
     await sendMailgunEmail(session.signer_email_snapshot, 'Talview NDA signing verification code', emailHtml, emailText)
+
+    const { error: updateError } = await supabase
+      .from('nda_signing_sessions')
+      .update({
+        otp_sha256: otpHash,
+        otp_expires_at: otpExpiresAt.toISOString(),
+        otp_failed_attempts: 0,
+        otp_send_count: session.otp_send_count + 1,
+        otp_last_sent_at: new Date().toISOString(),
+      })
+      .eq('id', session.id)
+    if (updateError) throw updateError
+
     await logEvent(supabase, session.id, 'otp_sent', req, {})
 
     return jsonResponse({ success: true, maskedEmail, expiresIn: 600 })

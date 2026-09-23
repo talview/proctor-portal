@@ -4,7 +4,7 @@ import type { User } from '@/types';
 
 const makeUser = (role: User['role'], vendor?: User['vendor']): User => ({
   id: '1', username: 'test', name: 'Test', email: 'test@test.com',
-  role, vendor, created_at: '', updated_at: '',
+  role, vendor, created_at: '', updated_at: '', mustChangePassword: false,
 });
 
 describe('getScopedVendor', () => {
